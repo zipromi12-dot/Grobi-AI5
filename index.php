@@ -1,31 +1,27 @@
 <?php
-// === КОНФИГУРАЦИЯ ===
+// === КОНФИГУРАЦИЯ СИСТЕМЫ ===
 ini_set('display_errors', 0);
 $token = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0";
 $adminId = 7640692963; 
 $api = "https://api.telegram.org/bot$token";
+$version = "2.5.0-STABLE";
 
-// --- SUPABASE НАСТРОЙКИ ---
-$sbUrl = "https://vqpurtindyaiwjgreqdt.supabase.co/rest/v1/bot_storage";
-$sbKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxcHVydGluZHlhaXdqZ3JlcWR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5MjA2NzksImV4cCI6MjA4OTQ5NjY3OX0.pRR7P3quZ7cX5EYZmHOxnx4C1gp9gMQuoMzNFa-lwM4";
-
-// --- УЛУЧШЕННАЯ ФУНКЦИЯ ОБЛАКА ---
+// --- SUPABASE ENGINE ---
 function sb_req($method, $id = null, $data = null) {
     global $sbUrl, $sbKey;
-    $url = $id ? "$sbUrl?id=eq." . urlencode($id) : $sbUrl;
+    $sbUrl = "https://vqpurtindyaiwjgreqdt.supabase.co/rest/v1/bot_storage";
+    $sbKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxcHVydGluZHlhaXdqZ3JlcWR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5MjA2NzksImV4cCI6MjA4OTQ5NjY3OX0.pRR7P3quZ7cX5EYZmHOxnx4C1gp9gMQuoMzNFa-lwM4";
     
-    // Если это GET запрос без ID, получаем все данные
-    if ($method == "GET" && !$id) $url .= "?select=id,data";
-    elseif ($method == "GET" && $id) $url .= "&select=data";
+    $url = $id ? "$sbUrl?id=eq." . urlencode($id) : $sbUrl;
+    if ($method == "GET") $url .= ($id ? "&select=data" : "?select=id,data");
 
     $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     $headers = ["apikey: $sbKey", "Authorization: Bearer $sbKey"];
 
-    if ($method == "POST" || $data) {
-        $payload = json_encode($data);
+    if ($method == "POST") {
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
         $headers[] = "Content-Type: application/json";
         $headers[] = "Prefer: resolution=merge-duplicates";
     }
@@ -41,13 +37,24 @@ function send($chatId, $text, $kb = null, $replyId = null) {
     $data = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => 'HTML', 'disable_web_page_preview' => true];
     if ($kb) $data['reply_markup'] = json_encode($kb);
     if ($replyId) $data['reply_to_message_id'] = $replyId;
-    $url = $api . "/sendMessage?" . http_build_query($data);
-    return file_get_contents($url);
+    return file_get_contents($api . "/sendMessage?" . http_build_query($data));
 }
 
-// === ОБРАБОТКА ОБНОВЛЕНИЯ ===
-$content = file_get_contents("php://input");
-$update = json_decode($content, true);
+// === ЛОГИКА ОБРАБОТКИ ===
+$update = json_decode(file_get_contents("php://input"), true);
+
+// 1. Приветствие новых участников
+if (isset($update['message']['new_chat_members'])) {
+    $cId = $update['message']['chat']['id'];
+    $conf = sb_req("GET", "conf_$cId")[0]['data'] ?? [];
+    if (isset($conf['welcome'])) {
+        $user = $update['message']['new_chat_members'][0]['first_name'];
+        $text = str_replace("{name}", $user, $conf['welcome']);
+        send($cId, $text);
+    }
+    exit;
+}
+
 $msg = $update['message'] ?? null;
 if (!$msg) exit;
 
@@ -57,182 +64,129 @@ $text = $msg['text'] ?? '';
 $reply = $msg['reply_to_message'] ?? null;
 $name = $msg['from']['first_name'];
 
-// --- ЗАГРУЗКА ДАННЫХ ---
-$uDataRaw = sb_req("GET", "u_$userId");
-$uData = $uDataRaw[0]['data'] ?? [];
-
-$chatConfRaw = sb_req("GET", "conf_$chatId");
-$chatConf = $chatConfRaw[0]['data'] ?? [];
-
+// --- ЗАГРУЗКА СОСТОЯНИЯ ---
+$uData = sb_req("GET", "u_$userId")[0]['data'] ?? [];
+$chatConf = sb_req("GET", "conf_$chatId")[0]['data'] ?? [];
+$globalData = sb_req("GET", "global_config")[0]['data'] ?? [];
 $isDev = ($userId == $adminId);
 
-$globalDataRaw = sb_req("GET", "global_config");
-$globalData = $globalDataRaw[0]['data'] ?? [];
-
-// --- ГЛОБАЛЬНЫЙ АНТИСПАМ ---
-if (isset($globalData['spammers'][$userId])) {
-    file_get_contents($api . "/banChatMember?chat_id=$chatId&user_id=$userId");
-    send($chatId, "🚫 <b>GLOBAL BAN:</b> Юзер <code>$userId</code> в спам-базе.\nПричина: " . $globalData['spammers'][$userId]['reason']);
-    exit;
-}
-
-// --- ОПРЕДЕЛЕНИЕ РАНГА ---
+// Ранг и права
 $chatMember = json_decode(file_get_contents($api . "/getChatMember?chat_id=$chatId&user_id=$userId"), true);
 $status = $chatMember['result']['status'] ?? '';
-$isCreator = ($status === 'creator');
-
 if ($isDev) $myRank = 6;
-elseif ($isCreator) $myRank = 5;
+elseif ($status === 'creator') $myRank = 5;
 else $myRank = (int)($uData['ranks'][$chatId] ?? 0);
 
-// --- STOP-USER ЗАЩИТА ---
-$ignRaw = sb_req("GET", "ign_$chatId");
-$ignored = $ignRaw[0]['data'] ?? [];
-if ($reply && isset($ignored[$reply['from']['id']]) && $ignored[$reply['from']['id']] == $userId) {
-    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=".$msg['message_id']);
+// Глобальный бан
+if (isset($globalData['spammers'][$userId])) {
+    file_get_contents($api . "/banChatMember?chat_id=$chatId&user_id=$userId");
     exit;
-}
-
-// --- ФИЛЬТР ССЫЛОК ---
-if ($myRank < 1 && (preg_match('/(https?:\/\/[^\s]+)/', $text) || preg_match('/(t\.me\/[^\s]+)/', $text) || preg_match('/@[^\s]+/', $text))) {
-    $allowed = false;
-    if (isset($chatConf['whitelist'])) {
-        foreach ($chatConf['whitelist'] as $link) {
-            if (strpos($text, $link) !== false) { $allowed = true; break; }
-        }
-    }
-    if (!$allowed) {
-        file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=".$msg['message_id']);
-        send($chatId, "⚠️ <b>$name</b>, ссылки запрещены!");
-        exit;
-    }
 }
 
 // === КОМАНДЫ ===
 
-// 1. HELP
-if (strpos($text, '/help') === 0) {
-    $h = "📖 <b>МЕНЮ КОМАНД</b>\n\n";
-    $h .= "👤 <b>ОБЩИЕ:</b>\n/info, /ping, /admin, /support\n\n";
-    $h .= "🛡 <b>МОДЕРАЦИЯ (1+):</b>\n/del, /mute, /unmute, /warn, /unwarn, /ban\n\n";
-    $h .= "📂 <b>СПИСКИ:</b>\n/mutelist, /warnlist, /spamlist, /stop_list\n\n";
-    $h .= "⚙️ <b>НАСТРОЙКИ (4+):</b>\n/rank, /dc, /whitelist, /unstop\n\n";
-    $h .= "⚒ <b>AGENTS:</b>\n/agent, /gg, /set_support";
-    send($chatId, $h);
+// ПИНГ (Расширенный)
+if ($text == '/ping') {
+    $start = microtime(true);
+    $dbStatus = (!empty($globalData)) ? "Connected ✅" : "Error ❌";
+    $latency = round((microtime(true) - $start) * 1000);
+    $p = "📶 <b>SYSTEM STATUS</b>\n";
+    $p .= "━━━━━━━━━━━━━━━\n";
+    $p .= "🛰 Latency: <code>{$latency}ms</code>\n";
+    $p .= "🗄 Database: <code>$dbStatus</code>\n";
+    $p .= "🛠 Version: <code>$version</code>\n";
+    $p .= "👑 Your Rank: <b>$myRank</b>";
+    send($chatId, $p);
 }
 
-// 2. СПИСКИ
-if ($text == '/warnlist') {
-    $all = sb_req("GET");
-    $out = "⚠️ <b>Варны в чате:</b>\n";
-    $found = false;
-    foreach($all as $it) {
-        $wid = str_replace('u_', '', $it['id']);
-        if (isset($it['data']['warns'][$chatId]) && $it['data']['warns'][$chatId] > 0) {
-            $out .= "• " . ($it['data']['name'] ?? "Юзер") . " [<code>$wid</code>]: <b>".$it['data']['warns'][$chatId]."/3</b>\n";
-            $found = true;
-        }
-    }
-    send($chatId, $found ? $out : "Варнов нет.");
-}
-
-if ($text == '/spamlist') {
-    $out = "🚫 <b>Глобальные спамеры:</b>\n";
-    if (empty($globalData['spammers'])) $out .= "Список пуст.";
-    else {
-        foreach ($globalData['spammers'] as $sid => $info) {
-            $out .= "• <code>$sid</code> | " . $info['reason'] . " (by " . $info['by'] . ")\n";
-        }
-    }
-    send($chatId, $out);
-}
-
-if ($text == '/stop_list') {
-    $out = "🛑 <b>Stop-User Список:</b>\n";
-    if (empty($ignored)) $out .= "Никто не в игноре.";
-    else {
-        foreach ($ignored as $target => $owner) {
-            $out .= "• Юзер <code>$target</code> игнорируется <code>$owner</code>\n";
-        }
-    }
-    send($chatId, $out);
-}
-
-// 3. УПРАВЛЕНИЕ AGENT / GG
-if (strpos($text, '/gg') === 0 && ($isDev || ($uData['is_agent'] ?? false))) {
-    $parts = explode(' ', $text, 3);
-    $targetId = $reply ? $reply['from']['id'] : ($parts[1] ?? null);
-    $reason = $parts[2] ?? ($reply ? ($parts[1] ?? "Спам") : "Спам");
-    
-    if ($targetId && is_numeric($targetId)) {
-        $globalData['spammers'][$targetId] = ['reason' => $reason, 'by' => $userId];
-        sb_req("POST", "global_config", ["id" => "global_config", "data" => $globalData]);
-        file_get_contents($api . "/banChatMember?chat_id=$chatId&user_id=$targetId");
-        send($chatId, "⛓ <b>GLOBAL BAN:</b> Юзер <code>$targetId</code> забанен везде.\nПричина: $reason");
-    } else {
-        send($chatId, "❌ Используй /gg [id] [причина] или ответом.");
-    }
-}
-
-if ($text == '/agent') {
-    if (($uData['is_agent'] ?? false) || $isDev) {
-        $num = $uData['agent_num'] ?? "DEV-01";
-        $m = "<a href='tg://user?id=$userId'>$name</a>";
-        send($chatId, "🛡 <b>АГЕНТ #$num</b>\nСотрудник $m подтвердил личность.\nСтатус: <b>Верифицирован</b>");
-    }
-}
-
-// 4. WHITELIST
-if (preg_match('/^\/whitelist\s+([^\s]+)/', $text, $m) && $myRank >= 4) {
-    $chatConf['whitelist'][] = $m[1];
+// ПРАВИЛА И ПРИВЕТСТВИЕ
+if (strpos($text, '/set_rules') === 0 && $myRank >= 4) {
+    $chatConf['rules'] = substr($text, 11);
     sb_req("POST", "conf_$chatId", ["id" => "conf_$chatId", "data" => $chatConf]);
-    send($chatId, "✅ Ссылка <code>".$m[1]."</code> разрешена.");
+    send($chatId, "✅ Правила чата обновлены.");
 }
 
-// 5. МОДЕРАЦИЯ (ОТВЕТОМ)
+if ($text == '/rules') {
+    $r = $chatConf['rules'] ?? "Правила еще не установлены.";
+    send($chatId, "📜 <b>ПРАВИЛА ЧАТА:</b>\n\n$r");
+}
+
+if (strpos($text, '/set_welcome') === 0 && $myRank >= 4) {
+    $chatConf['welcome'] = substr($text, 13);
+    sb_req("POST", "conf_$chatId", ["id" => "conf_$chatId", "data" => $chatConf]);
+    send($chatId, "✅ Приветствие обновлено. Используйте {name} для тега юзера.");
+}
+
+// СИСТЕМА ЗАЯВОК (SEND_SUPPORT)
+if (strpos($text, '/send_support') === 0) {
+    $reason = substr($text, 14);
+    if (empty($reason)) {
+        send($chatId, "❌ Опишите причину заявки после команды.");
+    } else {
+        $ticket = "🎫 <b>НОВАЯ ЗАЯВКА</b>\n";
+        $ticket .= "👤 От: <code>$userId</code> ($name)\n";
+        $ticket .= "📍 Чат: <code>$chatId</code>\n";
+        $ticket .= "📝 Суть: $reason";
+        
+        // Отправка всем агентам и админу
+        $all = sb_req("GET");
+        foreach($all as $it) {
+            $aid = str_replace('u_', '', $it['id']);
+            if (($it['data']['is_agent'] ?? false) || $aid == $adminId) {
+                send($aid, $ticket);
+            }
+        }
+        send($chatId, "✅ Ваша заявка отправлена персоналу проекта.");
+    }
+}
+
+// МОДЕРАЦИЯ (ОТВЕТОМ)
 if ($reply && $myRank >= 1) {
     $tId = $reply['from']['id'];
-    if ($text == '/del') {
-        file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=".$reply['message_id']);
-        file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=".$msg['message_id']);
+    
+    if ($text == '/kick') {
+        file_get_contents($api . "/unbanChatMember?chat_id=$chatId&user_id=$tId");
+        send($chatId, "👢 Пользователь кикнут.");
     }
-    if ($text == '/warn') {
-        $tDataRaw = sb_req("GET", "u_$tId");
-        $tData = $tDataRaw[0]['data'] ?? [];
-        $tData['warns'][$chatId] = ($tData['warns'][$chatId] ?? 0) + 1;
-        $tData['name'] = $reply['from']['first_name'];
-        if ($tData['warns'][$chatId] >= 3) {
-            file_get_contents($api . "/banChatMember?chat_id=$chatId&user_id=$tId");
-            $tData['warns'][$chatId] = 0;
-            send($chatId, "🚫 3/3 варна. Бан юзеру.");
-        } else {
-            send($chatId, "⚠️ Варн: " . $tData['warns'][$chatId] . "/3");
-        }
-        sb_req("POST", "u_$tId", ["id" => "u_$tId", "data" => $tData]);
+    
+    if ($text == '/ban' && $myRank >= 2) {
+        file_get_contents($api . "/banChatMember?chat_id=$chatId&user_id=$tId");
+        send($chatId, "🔨 Пользователь забанен.");
+    }
+    
+    if ($text == '/unban' && $myRank >= 3) {
+        file_get_contents($api . "/unbanChatMember?chat_id=$chatId&user_id=$tId&only_if_banned=true");
+        send($chatId, "🔓 Разбанен.");
+    }
+
+    if ($text == '/unmute' && $myRank >= 1) {
+        file_get_contents($api . "/restrictChatMember?chat_id=$chatId&user_id=$tId&permissions=".urlencode(json_encode(['can_send_messages'=>true,'can_send_media_messages'=>true,'can_send_other_messages'=>true,'can_add_web_page_previews'=>true])));
+        send($chatId, "🔊 Ограничения сняты.");
     }
 }
 
-// 6. ПИНГ И ИНФО
-if ($text == '/ping') {
-    $load = sys_getloadavg();
-    send($chatId, "📶 <b>Статус:</b> Online\nТвой ранг: <b>$myRank ($status)</b>");
-}
-
-if ($text == '/admin') {
-    $all = sb_req("GET");
-    $out = "🛡 <b>Администрация:</b>\n";
-    $names = [6=>"РАЗРАБОТЧИК", 5=>"ВЛАДЕЛЬЦЫ", 1=>"МОДЕРАТОРЫ"];
-    foreach ([6,5,4,3,2,1] as $lvl) {
-        $found = false; $stars = str_repeat("⭐", ($lvl > 5 ? 5 : $lvl));
-        $tmp = "";
-        foreach ($all as $it) {
-            $rid = str_replace('u_', '', $it['id']);
-            $r = ($rid == $adminId) ? 6 : ($it['data']['ranks'][$chatId] ?? 0);
-            if ($r == $lvl) { $tmp .= "└ " . ($it['data']['name'] ?? "Юзер") . "\n"; $found = true; }
-        }
-        if ($found) $out .= "\n<b>$stars " . ($names[$lvl] ?? "РАНГ $lvl") . "</b>\n" . $tmp;
-    }
+// ИНФО О ЮЗЕРЕ
+if (strpos($text, '/info') === 0) {
+    $targetId = $reply ? $reply['from']['id'] : $userId;
+    $targetData = sb_req("GET", "u_$targetId")[0]['data'] ?? [];
+    $tr = ($targetId == $adminId) ? 6 : ($targetData['ranks'][$chatId] ?? 0);
+    $out = "👤 <b>USER INFO</b>\n";
+    $out .= "ID: <code>$targetId</code>\n";
+    $out .= "Rank: <b>$tr</b>\n";
+    $out .= "Warns: <b>".($targetData['warns'][$chatId] ?? 0)."/3</b>\n";
+    $out .= "Is Agent: " . (($targetData['is_agent'] ?? false) ? "Yes ✅" : "No ❌");
     send($chatId, $out);
+}
+
+// ОБНОВЛЕННЫЙ HELP
+if (strpos($text, '/help') === 0) {
+    $h = "📖 <b>GROBI COMMANDS</b>\n\n";
+    $h .= "📍 <b>Main:</b> /rules, /info, /ping, /admin\n";
+    $h .= "🛡 <b>Mod:</b> /del, /kick, /ban, /unban, /mute, /unmute, /warn, /unwarn\n";
+    $h .= "🎫 <b>Support:</b> /send_support [текст], /agent, /support\n";
+    $h .= "⚙️ <b>Config:</b> /set_rules, /set_welcome, /rank, /dc, /whitelist\n";
+    $h .= "⛓ <b>Global:</b> /gg [id] [reason], /ungg [id], /spamlist";
+    send($chatId, $h);
 }
 
 // СОХРАНЕНИЕ СТАТИСТИКИ
