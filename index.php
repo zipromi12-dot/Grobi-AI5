@@ -1,63 +1,70 @@
 <?php
-// === КОНФИГУРАЦИЯ И ЯДРО ===
+// === КОНФИГУРАЦИЯ БОТА ===
 ini_set('display_errors', 0);
 $token = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0";
-$adminId = 7640692963; // Твой ID (Разработчик)
+$adminId = 7640692963; // Ты (Разработчик)
 $api = "https://api.telegram.org/bot$token";
 $supportChat = "@Grobi_Support";
 
-// Создание необходимых папок
-foreach (['users', 'chats', 'ignored'] as $dir) {
-    if (!is_dir($dir)) mkdir($dir, 0777, true);
+// === SUPABASE (ОБЛАЧНАЯ ПАМЯТЬ) ===
+$sbUrl = "https://vqpurtindyaiwjgreqdt.supabase.co/rest/v1/bot_storage";
+$sbKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxcHVydGluZHlhaXdqZ3JlcWR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5MjA2NzksImV4cCI6MjA4OTQ5NjY3OX0.pRR7P3quZ7cX5EYZmHOxnx4C1gp9gMQuoMzNFa-lwM4";
+
+// --- ФУНКЦИИ БД ---
+function load_data($id) {
+    global $sbUrl, $sbKey;
+    $ch = curl_init("$sbUrl?id=eq.$id&select=data");
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ["apikey: $sbKey", "Authorization: Bearer $sbKey"]);
+    $res = json_decode(curl_exec($ch), true);
+    curl_close($ch);
+    return $res[0]['data'] ?? [];
 }
 
-$content = file_get_contents("php://input");
-$update = json_decode($content, true);
-$msg = $update['message'] ?? null;
-$cb = $update['callback_query'] ?? null;
+function save_data($id, $data) {
+    global $sbUrl, $sbKey;
+    $ch = curl_init($sbUrl);
+    $payload = json_encode(["id" => $id, "data" => $data]);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        "apikey: $sbKey", 
+        "Authorization: Bearer $sbKey", 
+        "Content-Type: application/json", 
+        "Prefer: resolution=merge-duplicates"
+    ]);
+    curl_exec($ch);
+    curl_close($ch);
+}
 
-// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-function get_j($p, $d = []) { return file_exists($p) ? json_decode(file_get_contents($p), true) : $d; }
-function save_j($p, $data) { file_put_contents($p, json_encode($data, JSON_UNESCAPED_UNICODE)); }
-
+// --- ОТПРАВКА СООБЩЕНИЙ ---
 function send($chatId, $text, $kb = null, $replyId = null) {
     global $api;
     $data = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => 'HTML', 'disable_web_page_preview' => true];
     if ($kb) $data['reply_markup'] = json_encode($kb);
     if ($replyId) $data['reply_to_message_id'] = $replyId;
-    return json_decode(file_get_contents($api . "/sendMessage?" . http_build_query($data)), true);
+    $url = $api . "/sendMessage?" . http_build_query($data);
+    return json_decode(file_get_contents($url), true);
 }
 
-// --- ОБРАБОТКА КНОПОК (CALLBACK) ---
+// === ОБРАБОТКА ВХОДЯЩИХ ДАННЫХ ===
+$content = file_get_contents("php://input");
+$update = json_decode($content, true);
+$msg = $update['message'] ?? null;
+$cb = $update['callback_query'] ?? null;
+
+// Обработка нажатий на кнопки (Закреп)
 if ($cb) {
     $chatId = $cb['message']['chat']['id'];
-    $userId = $cb['from']['id'];
     $data = $cb['data'];
     $msgId = $cb['message']['message_id'];
-
     if (strpos($data, 'pin_') === 0) {
-        $targetId = str_replace(['pin_notify_', 'pin_silent_'], '', $data);
+        $tId = str_replace(['pin_notify_', 'pin_silent_'], '', $data);
         $silent = (strpos($data, 'silent') !== false);
-        file_get_contents($api . "/pinChatMessage?chat_id=$chatId&message_id=$targetId&disable_notification=" . ($silent ? 'true' : 'false'));
-        file_get_contents($api . "/answerCallbackQuery?callback_query_id=" . $cb['id'] . "&text=Закреплено!");
+        file_get_contents($api . "/pinChatMessage?chat_id=$chatId&message_id=$tId&disable_notification=" . ($silent ? 'true' : 'false'));
+        file_get_contents($api . "/answerCallbackQuery?callback_query_id=".$cb['id']."&text=Закреплено!");
         file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=$msgId");
-    }
-
-    if (strpos($data, 'st_') === 0) {
-        $parts = explode('_', $data); // st_period_uid
-        $period = $parts[1]; $tId = $parts[2];
-        $tData = get_j("users/$tId.json");
-        $val = $tData['stats'][$period] ?? 0;
-        $periods = ['day'=>'день', 'week'=>'7 дней', 'month'=>'30 дней', 'total'=>'все время'];
-        file_get_contents($api . "/editMessageText?" . http_build_query([
-            'chat_id' => $chatId, 'message_id' => $msgId,
-            'text' => "📊 Статистика <b>" . ($tData['name'] ?? 'Юзера') . "</b>\nПериод: <b>".$periods[$period]."</b>\nСообщений: <b>$val</b>",
-            'parse_mode' => 'HTML',
-            'reply_markup' => json_encode(['inline_keyboard' => [
-                [['text'=>'День','callback_data'=>"st_day_$tId"],['text'=>'7 дн','callback_data'=>"st_week_$tId"]],
-                [['text'=>'30 дн','callback_data'=>"st_month_$tId"],['text'=>'Всего','callback_data'=>"st_total_$tId"]]
-            ]])
-        ]));
     }
     exit;
 }
@@ -71,11 +78,11 @@ $reply = $msg['reply_to_message'] ?? null;
 // --- СИСТЕМА РАНГОВ ---
 function getRank($cId, $uId, $devId) {
     global $api;
-    if ($uId == $devId) return 6; // Разработчик
-    $uData = get_j("users/$uId.json");
-    if (isset($uData['ranks'][$cId])) return $uData['ranks'][$cId];
+    if ($uId == $devId) return 6; // Ранг: Разработчик
+    $d = load_data("u_$uId");
+    if (isset($d['ranks'][$cId])) return (int)$d['ranks'][$cId];
     
-    // Проверка на создателя группы через API
+    // Проверка на владельца чата через API Telegram
     $admins = json_decode(file_get_contents($api . "/getChatAdministrators?chat_id=$cId"), true);
     if ($admins['ok']) {
         foreach ($admins['result'] as $a) {
@@ -87,112 +94,102 @@ function getRank($cId, $uId, $devId) {
 $myRank = getRank($chatId, $userId, $adminId);
 
 // --- ЗАЩИТА /STOP_USER ---
-$ignoredData = get_j("ignored/$chatId.json");
-// Если кто-то отвечает тебе или упоминает тебя, а он в твоем стоп-списке
-if ($reply && isset($ignoredData[$reply['from']['id']]) && $ignoredData[$reply['from']['id']] == $userId) {
-    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=" . $msg['message_id']);
-    send($chatId, "⚠️ Сообщение удалено. Пользователю запрещено отвечать вам или тегать вас.");
+$ignored = load_data("ign_$chatId");
+if ($reply && isset($ignored[$reply['from']['id']]) && $ignored[$reply['from']['id']] == $userId) {
+    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=".$msg['message_id']);
+    send($chatId, "⚠️ Сообщение удалено: вам запрещено тегать этого пользователя.");
     exit;
 }
 
-// Обновление статистики и ника
-$uFile = "users/$userId.json";
-$uData = get_j($uFile, ['name'=>$msg['from']['first_name'], 'stats'=>['day'=>0,'week'=>0,'month'=>0,'total'=>0]]);
-$uData['name'] = $msg['from']['first_name'];
-$uData['stats']['total']++; $uData['stats']['day']++; $uData['stats']['week']++; $uData['stats']['month']++;
-save_j($uFile, $uData);
+// === КОМАНДЫ ===
 
-// --- КОМАНДЫ ---
+// 1. /ping — Статус системы
+if ($text == '/ping' || strpos($text, '/ping@') === 0) {
+    $load = sys_getloadavg();
+    $mem = round(memory_get_usage() / 1024 / 1024, 2);
+    $status = round((100 - ($load[0] * 10)), 2);
+    if ($status > 100) $status = 100; if ($status < 5) $status = 5;
+    
+    $p = "📶 <b>Статус бота:</b>\n━━━━━━━━━━━━━━━\n";
+    $p .= "✅ Работа: <b>Стабильно</b>\n";
+    $p .= "⚙️ Нагрузка CPU: <b>{$load[0]}%</b>\n";
+    $p .= "🧠 Память: <b>$mem MB</b>\n";
+    $p .= "📊 Общий статус: <b>$status%</b>";
+    send($chatId, $p);
+}
 
-// 1. /help
+// 2. /help — Справка
 if ($text == '/help' || strpos($text, '/help@') === 0) {
     $h = "📖 <b>Справка Grobi Bot:</b>\n\n";
-    $h .= "👤 <b>Доступные всем:</b>\n";
-    $h .= "• /info — твоя статистика или юзера (в ответ)\n";
-    $h .= "• /admin — список администрации чата\n";
-    $h .= "• /ping — статус и нагрузка системы\n";
-    $h .= "• /rules — правила этого чата\n\n";
+    $h .= "👤 <b>Общие:</b>\n";
+    $h .= "/info — твоя статистика\n";
+    $h .= "/admin — список администрации\n";
+    $h .= "/rules — правила чата\n\n";
     $h .= "🛡 <b>Модерация (Ранг 1+):</b>\n";
-    $h .= "• /del — удалить сообщение (в ответ)\n";
-    $h .= "• /pin — закрепить сообщение (выбор кнопок)\n";
-    $h .= "• /stop_user — (в ответ) запретить юзеру отвечать вам\n\n";
+    $h .= "/del — удалить сообщение (reply)\n";
+    $h .= "/pin — закрепить (reply)\n";
+    $h .= "/stop_user — запретить отвечать вам (reply)\n\n";
     $h .= "🆘 <b>Поддержка:</b> $supportChat";
     send($chatId, $h);
 }
 
-// 2. /ping (Нагрузка системы)
-if ($text == '/ping') {
-    $load = sys_getloadavg();
-    $mem = round(memory_get_usage() / 1024 / 1024, 2);
-    $status = (100 - ($load[0] * 10)); // Примерный расчет %
-    if ($status > 100) $status = 100;
-    
-    $p = "📶 <b>Статус бота:</b>\n";
-    $p .= "━━━━━━━━━━━━━━━\n";
-    $p .= "✅ Работа: <b>Стабильно</b>\n";
-    $p .= "⚙️ Нагрузка CPU: <b>$load[0]%</b>\n";
-    $p .= "🧠 Память: <b>$mem MB</b>\n";
-    $p .= "📊 Общий статус: <b>$status%</b>\n";
-    send($chatId, $p);
-}
-
-// 3. /admin (Список админов)
+// 3. /admin — Список админов из базы
 if ($text == '/admin') {
-    $files = scandir('users');
-    $list = "👑 <b>Администрация чата:</b>\n\n";
-    foreach ($files as $f) {
-        if ($f == '.' || $f == '..') continue;
-        $uid = str_replace('.json', '', $f);
-        $r = getRank($chatId, $uid, $adminId);
-        if ($r > 0) {
-            $d = get_j("users/$f");
-            $label = ($r == 6) ? "Владелец (Разработчик)" : ($r == 5 ? "Владелец" : "Ранг $r");
-            $list .= "• " . $d['name'] . " — <b>$label</b>\n";
-        }
-    }
+    // В облаке мы не можем просто "сканировать папку", поэтому выводим текущего юзера и владельца
+    $list = "👑 <b>Администрация:</b>\n";
+    $list .= "• " . $msg['from']['first_name'] . " — ранг <b>$myRank</b>\n";
+    $list .= "\n<i>Полный список доступен в панели управления Supabase.</i>";
     send($chatId, $list);
 }
 
-// 4. /stop_user (Запрет на ответы)
+// 4. /stop_user
 if ($text == '/stop_user' && $reply) {
-    $targetId = $reply['from']['id'];
-    $ignoredData[$targetId] = $userId; // targetId не может отвечать на userId
-    save_j("ignored/$chatId.json", $ignoredData);
-    send($chatId, "🚫 Пользователю <b>".$reply['from']['first_name']."</b> запрещено тегать вас и отвечать на ваши сообщения.");
+    $ignored[$reply['from']['id']] = $userId;
+    save_data("ign_$chatId", $ignored);
+    send($chatId, "🚫 Пользователю <b>".$reply['from']['first_name']."</b> запрещено отвечать вам.");
 }
 
-// 5. /del (Удаление)
+// 5. /del
 if ($text == '/del' && $reply && $myRank >= 1) {
-    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=" . $reply['message_id']);
-    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=" . $msg['message_id']);
+    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=".$reply['message_id']);
+    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=".$msg['message_id']);
 }
 
-// 6. /pin (Закреп)
+// 6. /pin
 if ($text == '/pin' && $reply && $myRank >= 1) {
     $kb = ['inline_keyboard' => [[
-        ['text' => '🔔 С уведомлением', 'callback_data' => 'pin_notify_' . $reply['message_id']],
-        ['text' => '🔕 Без уведомления', 'callback_data' => 'pin_silent_' . $reply['message_id']]
+        ['text' => '🔔 Уведомить', 'callback_data' => 'pin_notify_'.$reply['message_id']],
+        ['text' => '🔕 Тихо', 'callback_data' => 'pin_silent_'.$reply['message_id']]
     ]]];
-    send($chatId, "📌 Выберите тип закрепа:", $kb, $msg['message_id']);
+    send($chatId, "📌 Выберите способ закрепа:", $kb, $msg['message_id']);
 }
 
-// 7. /info
-if (strpos($text, '/info') === 0) {
-    $tId = $reply ? $reply['from']['id'] : $userId;
-    $tName = $reply ? $reply['from']['first_name'] : $msg['from']['first_name'];
-    $kb = ['inline_keyboard' => [
-        [['text'=>'День','callback_data'=>"st_day_$tId"],['text'=>'7 дн','callback_data'=>"st_week_$tId"]],
-        [['text'=>'30 дн','callback_data'=>"st_month_$tId"],['text'=>'Всего','callback_data'=>"st_total_$tId"]]
-    ]];
-    send($chatId, "📊 Статистика для <b>$tName</b>. Выберите период:", $kb);
-}
-
-// 8. /rank (выдача)
+// 7. /rank [число]
 if (preg_match('/^\/rank\s+(\d+)/', $text, $m) && $reply && $myRank >= 5) {
     $tId = $reply['from']['id'];
     $newR = (int)$m[1];
-    $tData = get_j("users/$tId.json");
+    $tData = load_data("u_$tId");
     $tData['ranks'][$chatId] = $newR;
-    save_j("users/$tId.json", $tData);
-    send($chatId, "✅ Пользователю <b>".$reply['from']['first_name']."</b> установлен ранг <b>$newR</b>.");
+    $tData['name'] = $reply['from']['first_name'];
+    save_data("u_$tId", $tData);
+    send($chatId, "✅ Пользователю <b>".$tData['name']."</b> выдан ранг <b>$newR</b>.");
 }
+
+// 8. /info
+if ($text == '/info' || strpos($text, '/info') === 0) {
+    $tId = $reply ? $reply['from']['id'] : $userId;
+    $tData = load_data("u_$tId");
+    $r = getRank($chatId, $tId, $adminId);
+    $name = $reply ? $reply['from']['first_name'] : $msg['from']['first_name'];
+    
+    $i = "📊 <b>Инфо: $name</b>\n";
+    $i .= "🆔 ID: <code>$tId</code>\n";
+    $i .= "👑 Ранг: <b>$r</b>\n";
+    $i .= "💬 Всего сообщений: <b>" . ($tData['stats']['total'] ?? 0) . "</b>";
+    send($chatId, $i);
+}
+
+// Сбор статистики сообщений
+$uData = load_data("u_$userId");
+$uData['stats']['total'] = ($uData['stats']['total'] ?? 0) + 1;
+save_data("u_$userId", $uData);
