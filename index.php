@@ -1,263 +1,198 @@
 <?php
-// === НАСТРОЙКИ БОТА ===
+// === КОНФИГУРАЦИЯ И ЯДРО ===
 ini_set('display_errors', 0);
 $token = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0";
-$adminId = 7640692963;
+$adminId = 7640692963; // Твой ID (Разработчик)
 $api = "https://api.telegram.org/bot$token";
+$supportChat = "@Grobi_Support";
 
-// === СОЗДАНИЕ ПАПОК АВТОМАТИЧЕСКИ ===
-if (!is_dir('users')) mkdir('users', 0777, true);
-if (!is_dir('chats')) mkdir('chats', 0777, true);
+// Создание необходимых папок
+foreach (['users', 'chats', 'ignored'] as $dir) {
+    if (!is_dir($dir)) mkdir($dir, 0777, true);
+}
 
-// === ПОЛУЧЕНИЕ ДАННЫХ ===
 $content = file_get_contents("php://input");
 $update = json_decode($content, true);
-
-// Обработка сообщений и коллбэков (кнопок)
 $msg = $update['message'] ?? null;
 $cb = $update['callback_query'] ?? null;
 
+// --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+function get_j($p, $d = []) { return file_exists($p) ? json_decode(file_get_contents($p), true) : $d; }
+function save_j($p, $data) { file_put_contents($p, json_encode($data, JSON_UNESCAPED_UNICODE)); }
+
+function send($chatId, $text, $kb = null, $replyId = null) {
+    global $api;
+    $data = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => 'HTML', 'disable_web_page_preview' => true];
+    if ($kb) $data['reply_markup'] = json_encode($kb);
+    if ($replyId) $data['reply_to_message_id'] = $replyId;
+    return json_decode(file_get_contents($api . "/sendMessage?" . http_build_query($data)), true);
+}
+
+// --- ОБРАБОТКА КНОПОК (CALLBACK) ---
 if ($cb) {
     $chatId = $cb['message']['chat']['id'];
     $userId = $cb['from']['id'];
-    $cbData = $cb['data'];
-    $cbId = $cb['id'];
-    
-    if ($cbData == 'help') {
-        file_get_contents($api . "/answerCallbackQuery?callback_query_id=$cbId&text=" . urlencode("Раздел помощи в разработке!"));
+    $data = $cb['data'];
+    $msgId = $cb['message']['message_id'];
+
+    if (strpos($data, 'pin_') === 0) {
+        $targetId = str_replace(['pin_notify_', 'pin_silent_'], '', $data);
+        $silent = (strpos($data, 'silent') !== false);
+        file_get_contents($api . "/pinChatMessage?chat_id=$chatId&message_id=$targetId&disable_notification=" . ($silent ? 'true' : 'false'));
+        file_get_contents($api . "/answerCallbackQuery?callback_query_id=" . $cb['id'] . "&text=Закреплено!");
+        file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=$msgId");
+    }
+
+    if (strpos($data, 'st_') === 0) {
+        $parts = explode('_', $data); // st_period_uid
+        $period = $parts[1]; $tId = $parts[2];
+        $tData = get_j("users/$tId.json");
+        $val = $tData['stats'][$period] ?? 0;
+        $periods = ['day'=>'день', 'week'=>'7 дней', 'month'=>'30 дней', 'total'=>'все время'];
+        file_get_contents($api . "/editMessageText?" . http_build_query([
+            'chat_id' => $chatId, 'message_id' => $msgId,
+            'text' => "📊 Статистика <b>" . ($tData['name'] ?? 'Юзера') . "</b>\nПериод: <b>".$periods[$period]."</b>\nСообщений: <b>$val</b>",
+            'parse_mode' => 'HTML',
+            'reply_markup' => json_encode(['inline_keyboard' => [
+                [['text'=>'День','callback_data'=>"st_day_$tId"],['text'=>'7 дн','callback_data'=>"st_week_$tId"]],
+                [['text'=>'30 дн','callback_data'=>"st_month_$tId"],['text'=>'Всего','callback_data'=>"st_total_$tId"]]
+            ]])
+        ]));
     }
     exit;
 }
 
 if (!$msg) exit;
-
 $chatId = $msg['chat']['id'];
 $userId = $msg['from']['id'];
-$userName = $msg['from']['first_name'] ?? 'Без имени';
 $text = $msg['text'] ?? '';
 $reply = $msg['reply_to_message'] ?? null;
 
-// === БАЗА ДАННЫХ (JSON) ===
-function get_json($path, $default = []) {
-    return file_exists($path) ? json_decode(file_get_contents($path), true) : $default;
-}
-function save_json($path, $data) {
-    file_put_contents($path, json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT));
-}
-
-// === СТАТИСТИКА И ПОЛЬЗОВАТЕЛИ ===
-$uFile = "users/$userId.json";
-$uData = get_json($uFile, ['name' => $userName, 'ranks' => [], 'stats' => ['total'=>0, 'day'=>0, 'week'=>0, 'month'=>0]]);
-$uData['name'] = $userName; // Обновляем ник
-
-$today = date('Y-md');
-$thisWeek = date('Y-W');
-$thisMonth = date('Y-m');
-
-if (($uData['last_day'] ?? '') != $today) { $uData['stats']['day'] = 0; $uData['last_day'] = $today; }
-if (($uData['last_week'] ?? '') != $thisWeek) { $uData['stats']['week'] = 0; $uData['last_week'] = $thisWeek; }
-if (($uData['last_month'] ?? '') != $thisMonth) { $uData['stats']['month'] = 0; $uData['last_month'] = $thisMonth; }
-
-$uData['stats']['total']++; $uData['stats']['day']++; $uData['stats']['week']++; $uData['stats']['month']++;
-save_json($uFile, $uData);
-
-// === НАСТРОЙКИ ЧАТА ===
-$cFile = "chats/$chatId.json";
-$chatConfig = get_json($cFile, [
-    'welcome' => "Привет, [username]! Добро пожаловать!",
-    'rules' => "Правила пока не установлены.",
-    'warns' => [], // Хранилище предупреждений
-    'commands' => ['info' => 0, 'rules' => 0] // Мин. ранг для команд
-]);
-
-// Получить ранг
-function getRank($cId, $uId, $ownerId) {
-    if ($uId == $ownerId) return 5;
-    $d = get_json("users/$uId.json");
-    return $d['ranks'][$cId] ?? 0;
+// --- СИСТЕМА РАНГОВ ---
+function getRank($cId, $uId, $devId) {
+    global $api;
+    if ($uId == $devId) return 6; // Разработчик
+    $uData = get_j("users/$uId.json");
+    if (isset($uData['ranks'][$cId])) return $uData['ranks'][$cId];
+    
+    // Проверка на создателя группы через API
+    $admins = json_decode(file_get_contents($api . "/getChatAdministrators?chat_id=$cId"), true);
+    if ($admins['ok']) {
+        foreach ($admins['result'] as $a) {
+            if ($a['user']['id'] == $uId && $a['status'] == 'creator') return 5;
+        }
+    }
+    return 0;
 }
 $myRank = getRank($chatId, $userId, $adminId);
 
-// === ФУНКЦИИ API ===
-function send($chatId, $text, $keyboard = null) {
-    global $api;
-    $data = ['chat_id' => $chatId, 'text' => $text, 'parse_mode' => 'HTML'];
-    if ($keyboard) $data['reply_markup'] = json_encode($keyboard);
-    file_get_contents($api . "/sendMessage?" . http_build_query($data));
+// --- ЗАЩИТА /STOP_USER ---
+$ignoredData = get_j("ignored/$chatId.json");
+// Если кто-то отвечает тебе или упоминает тебя, а он в твоем стоп-списке
+if ($reply && isset($ignoredData[$reply['from']['id']]) && $ignoredData[$reply['from']['id']] == $userId) {
+    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=" . $msg['message_id']);
+    send($chatId, "⚠️ Сообщение удалено. Пользователю запрещено отвечать вам или тегать вас.");
+    exit;
 }
 
-function tg_action($action, $chatId, $userId, $until = 0) {
-    global $api;
-    $url = "$api/$action?chat_id=$chatId&user_id=$userId";
-    if ($until > 0) $url .= "&until_date=$until";
-    if ($action == 'restrictChatMember') {
-        $url .= "&permissions=" . urlencode(json_encode(['can_send_messages' => false]));
-    }
-    file_get_contents($url);
+// Обновление статистики и ника
+$uFile = "users/$userId.json";
+$uData = get_j($uFile, ['name'=>$msg['from']['first_name'], 'stats'=>['day'=>0,'week'=>0,'month'=>0,'total'=>0]]);
+$uData['name'] = $msg['from']['first_name'];
+$uData['stats']['total']++; $uData['stats']['day']++; $uData['stats']['week']++; $uData['stats']['month']++;
+save_j($uFile, $uData);
+
+// --- КОМАНДЫ ---
+
+// 1. /help
+if ($text == '/help' || strpos($text, '/help@') === 0) {
+    $h = "📖 <b>Справка Grobi Bot:</b>\n\n";
+    $h .= "👤 <b>Доступные всем:</b>\n";
+    $h .= "• /info — твоя статистика или юзера (в ответ)\n";
+    $h .= "• /admin — список администрации чата\n";
+    $h .= "• /ping — статус и нагрузка системы\n";
+    $h .= "• /rules — правила этого чата\n\n";
+    $h .= "🛡 <b>Модерация (Ранг 1+):</b>\n";
+    $h .= "• /del — удалить сообщение (в ответ)\n";
+    $h .= "• /pin — закрепить сообщение (выбор кнопок)\n";
+    $h .= "• /stop_user — (в ответ) запретить юзеру отвечать вам\n\n";
+    $h .= "🆘 <b>Поддержка:</b> $supportChat";
+    send($chatId, $h);
 }
 
-// Парсинг времени (10m, 2h, 1d)
-function parseTime($str) {
-    $val = (int)$str;
-    if (strpos($str, 'm')) return time() + ($val * 60);
-    if (strpos($str, 'h')) return time() + ($val * 3600);
-    if (strpos($str, 'd')) return time() + ($val * 86400);
-    return 0; // Навсегда
+// 2. /ping (Нагрузка системы)
+if ($text == '/ping') {
+    $load = sys_getloadavg();
+    $mem = round(memory_get_usage() / 1024 / 1024, 2);
+    $status = (100 - ($load[0] * 10)); // Примерный расчет %
+    if ($status > 100) $status = 100;
+    
+    $p = "📶 <b>Статус бота:</b>\n";
+    $p .= "━━━━━━━━━━━━━━━\n";
+    $p .= "✅ Работа: <b>Стабильно</b>\n";
+    $p .= "⚙️ Нагрузка CPU: <b>$load[0]%</b>\n";
+    $p .= "🧠 Память: <b>$mem MB</b>\n";
+    $p .= "📊 Общий статус: <b>$status%</b>\n";
+    send($chatId, $p);
 }
 
-// Проверка прав на команду
-function checkAccess($cmd, $myRank, $chatConfig) {
-    $req = $chatConfig['commands'][$cmd] ?? 3; // По умолчанию модерские команды от 3 ранга
-    return ($myRank >= $req || $myRank == 5);
-}
-
-// === ЛОГИКА КОМАНД ===
-
-// ПРИВЕТСТВИЕ НОВИЧКОВ
-if (isset($msg['new_chat_members'])) {
-    foreach ($msg['new_chat_members'] as $member) {
-        if ($chatConfig['welcome'] !== false) {
-            $txt = str_replace("[username]", "<a href='tg://user?id=".$member['id']."'>".$member['first_name']."</a>", $chatConfig['welcome']);
-            send($chatId, $txt);
+// 3. /admin (Список админов)
+if ($text == '/admin') {
+    $files = scandir('users');
+    $list = "👑 <b>Администрация чата:</b>\n\n";
+    foreach ($files as $f) {
+        if ($f == '.' || $f == '..') continue;
+        $uid = str_replace('.json', '', $f);
+        $r = getRank($chatId, $uid, $adminId);
+        if ($r > 0) {
+            $d = get_j("users/$f");
+            $label = ($r == 6) ? "Владелец (Разработчик)" : ($r == 5 ? "Владелец" : "Ранг $r");
+            $list .= "• " . $d['name'] . " — <b>$label</b>\n";
         }
     }
+    send($chatId, $list);
 }
 
-// ИНФО (/info)
-if (strpos($text, '/info') === 0 && checkAccess('info', $myRank, $chatConfig)) {
+// 4. /stop_user (Запрет на ответы)
+if ($text == '/stop_user' && $reply) {
+    $targetId = $reply['from']['id'];
+    $ignoredData[$targetId] = $userId; // targetId не может отвечать на userId
+    save_j("ignored/$chatId.json", $ignoredData);
+    send($chatId, "🚫 Пользователю <b>".$reply['from']['first_name']."</b> запрещено тегать вас и отвечать на ваши сообщения.");
+}
+
+// 5. /del (Удаление)
+if ($text == '/del' && $reply && $myRank >= 1) {
+    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=" . $reply['message_id']);
+    file_get_contents($api . "/deleteMessage?chat_id=$chatId&message_id=" . $msg['message_id']);
+}
+
+// 6. /pin (Закреп)
+if ($text == '/pin' && $reply && $myRank >= 1) {
+    $kb = ['inline_keyboard' => [[
+        ['text' => '🔔 С уведомлением', 'callback_data' => 'pin_notify_' . $reply['message_id']],
+        ['text' => '🔕 Без уведомления', 'callback_data' => 'pin_silent_' . $reply['message_id']]
+    ]]];
+    send($chatId, "📌 Выберите тип закрепа:", $kb, $msg['message_id']);
+}
+
+// 7. /info
+if (strpos($text, '/info') === 0) {
     $tId = $reply ? $reply['from']['id'] : $userId;
-    $tData = get_json("users/$tId.json");
-    $tR = getRank($chatId, $tId, $adminId);
-    $warns = $chatConfig['warns'][$tId] ?? 0;
-    
-    $out = "ℹ️ <b>Информация о пользователе:</b>\n";
-    $out .= "👤 Ник: " . ($tData['name'] ?? "Неизвестно") . "\n";
-    $out .= "🆔 ID: <code>$tId</code>\n";
-    $out .= "👑 Ранг в чате: <b>$tR</b>\n";
-    $out .= "⚠️ Варны: <b>$warns/3</b>\n\n";
-    $out .= "📩 <b>Сообщения:</b>\n";
-    $out .= "Сегодня: " . ($tData['stats']['day'] ?? 0) . "\n";
-    $out .= "Неделя: " . ($tData['stats']['week'] ?? 0) . "\n";
-    $out .= "Месяц: " . ($tData['stats']['month'] ?? 0) . "\n";
-    $out .= "Всего: " . ($tData['stats']['total'] ?? 0);
-    send($chatId, $out);
+    $tName = $reply ? $reply['from']['first_name'] : $msg['from']['first_name'];
+    $kb = ['inline_keyboard' => [
+        [['text'=>'День','callback_data'=>"st_day_$tId"],['text'=>'7 дн','callback_data'=>"st_week_$tId"]],
+        [['text'=>'30 дн','callback_data'=>"st_month_$tId"],['text'=>'Всего','callback_data'=>"st_total_$tId"]]
+    ]];
+    send($chatId, "📊 Статистика для <b>$tName</b>. Выберите период:", $kb);
 }
 
-// РАНГИ (/rank и /unrank)
-if (preg_match('/^\/rank\s?(\d+)?/', $text, $match) && $reply) {
+// 8. /rank (выдача)
+if (preg_match('/^\/rank\s+(\d+)/', $text, $m) && $reply && $myRank >= 5) {
     $tId = $reply['from']['id'];
-    $tName = $reply['from']['first_name'];
-    $oldR = getRank($chatId, $tId, $adminId);
-    
-    if (isset($match[1]) && $myRank == 5) {
-        $newR = (int)$match[1];
-        if ($newR >= 0 && $newR <= 5) {
-            $tData = get_json("users/$tId.json");
-            $tData['ranks'][$chatId] = $newR;
-            save_json("users/$tId.json", $tData);
-            $icon = ($newR > $oldR) ? "📈 Повышение" : "📉 Понижение";
-            send($chatId, "$icon!\n$tName теперь имеет ранг $newR.");
-        }
-    } else {
-        send($chatId, "Ранг $tName: $oldR");
-    }
-}
-
-if ($text == '/unrank' && $myRank == 5 && $reply) {
-    $tId = $reply['from']['id'];
-    $tData = get_json("users/$tId.json");
-    unset($tData['ranks'][$chatId]);
-    save_json("users/$tId.json", $tData);
-    send($chatId, "❌ Все ранги сняты с пользователя.");
-}
-
-// МОДЕРАЦИЯ (/mute, /ban, /kick, /warn)
-if ($reply && checkAccess('mod', $myRank, $chatConfig)) {
-    $tId = $reply['from']['id'];
-    $tName = $reply['from']['first_name'];
-    $args = explode(' ', $text);
-    $cmd = $args[0];
-    $timeStr = $args[1] ?? '0';
-    $reason = implode(' ', array_slice($args, 2)) ?: 'Не указана';
-    $until = parseTime($timeStr);
-
-    if ($cmd == '/mute') {
-        tg_action('restrictChatMember', $chatId, $tId, $until);
-        send($chatId, "🔇 <b>$tName</b> получил мут.\n⏳ Время: $timeStr\n📝 Причина: $reason");
-    }
-    elseif ($cmd == '/unmute') {
-        global $api;
-        file_get_contents("$api/restrictChatMember?chat_id=$chatId&user_id=$tId&permissions=".urlencode(json_encode(['can_send_messages'=>true])));
-        send($chatId, "🔊 <b>$tName</b> размучен.");
-    }
-    elseif ($cmd == '/ban') {
-        tg_action('banChatMember', $chatId, $tId, $until);
-        send($chatId, "🔨 <b>$tName</b> забанен!\n📝 Причина: $reason");
-    }
-    elseif ($cmd == '/unban') {
-        tg_action('unbanChatMember', $chatId, $tId);
-        send($chatId, "🕊 <b>$tName</b> разбанен.");
-    }
-    elseif ($cmd == '/kick') {
-        tg_action('banChatMember', $chatId, $tId);
-        tg_action('unbanChatMember', $chatId, $tId);
-        send($chatId, "👢 <b>$tName</b> кикнут из чата.");
-    }
-    elseif ($cmd == '/warn') {
-        $chatConfig['warns'][$tId] = ($chatConfig['warns'][$tId] ?? 0) + 1;
-        $w = $chatConfig['warns'][$tId];
-        save_json($cFile, $chatConfig);
-        send($chatId, "⚠️ <b>$tName</b> получил предупреждение ($w/3).\n📝 Причина: $reason");
-        
-        if ($w >= 3) { // Авто-мут на сутки за 3 варна
-            tg_action('restrictChatMember', $chatId, $tId, time() + 86400);
-            $chatConfig['warns'][$tId] = 0;
-            save_json($cFile, $chatConfig);
-            send($chatId, "🔇 <b>$tName</b> получил мут на 1 день за 3 предупреждения.");
-        }
-    }
-    elseif ($cmd == '/unwarn') {
-        $chatConfig['warns'][$tId] = max(0, ($chatConfig['warns'][$tId] ?? 0) - 1);
-        save_json($cFile, $chatConfig);
-        send($chatId, "✅ Варн снят. Текущие варны: {$chatConfig['warns'][$tId]}/3");
-    }
-}
-
-// НАСТРОЙКИ ЧАТА (/set_welcome, /del_welcome, /set_rules, /rules, /dc)
-if ($myRank >= 4) {
-    if (strpos($text, '/set_welcome') === 0) {
-        $chatConfig['welcome'] = trim(substr($text, 12)) ?: "Привет, [username]!";
-        save_json($cFile, $chatConfig);
-        send($chatId, "✅ Приветствие установлено.");
-    }
-    elseif ($text == '/del_welcome') {
-        $chatConfig['welcome'] = false;
-        save_json($cFile, $chatConfig);
-        send($chatId, "🗑 Приветствие отключено.");
-    }
-    elseif (strpos($text, '/set_rules') === 0) {
-        $chatConfig['rules'] = trim(substr($text, 10)) ?: "Правила не заданы.";
-        save_json($cFile, $chatConfig);
-        send($chatId, "✅ Правила чата обновлены!");
-    }
-    elseif (preg_match('/^\/dc\s+(\w+)\s+(\d+)$/', $text, $m) && $myRank == 5) {
-        $chatConfig['commands'][$m[1]] = (int)$m[2];
-        save_json($cFile, $chatConfig);
-        send($chatId, "⚙️ Доступ к /{$m[1]} теперь от {$m[2]} ранга.");
-    }
-}
-
-if ($text == '/rules' || strpos($text, '/rules@') === 0) {
-    send($chatId, "📜 <b>Правила чата:</b>\n\n" . $chatConfig['rules']);
-}
-
-// ИНТЕРАКТИВНОЕ МЕНЮ (/menu)
-if ($text == '/menu') {
-    $kb = [
-        'inline_keyboard' => [
-            [['text' => 'ℹ️ Мой профиль', 'callback_data' => 'profile']],
-            [['text' => '❓ Помощь', 'callback_data' => 'help'], ['text' => '📜 Правила', 'callback_data' => 'rules']]
-        ]
-    ];
-    send($chatId, "⚙️ <b>Главное меню бота</b>\nВыберите действие ниже:", $kb);
+    $newR = (int)$m[1];
+    $tData = get_j("users/$tId.json");
+    $tData['ranks'][$chatId] = $newR;
+    save_j("users/$tId.json", $tData);
+    send($chatId, "✅ Пользователю <b>".$reply['from']['first_name']."</b> установлен ранг <b>$newR</b>.");
 }
