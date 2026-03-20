@@ -5,16 +5,15 @@ error_reporting(0);
 
 $token   = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0";
 $adminId = 7640692963;
-$api     = "[api.telegram.org](https://api.telegram.org/bot$token)";
+$api = "https://api.telegram.org/bot$token";
 $version = "2.7.0";
 
 // ===================================================================
 // ДВИЖОК БАЗЫ ДАННЫХ (Supabase)
 // ===================================================================
 function sb_req($method, $id = null, $data = null) {
-    $sbUrl = "[vqpurtindyaiwjgreqdt.supabase.co](https://vqpurtindyaiwjgreqdt.supabase.co/rest/v1/bot_storage)";
+    $sbUrl = "https://vqpurtindyaiwjgreqdt.supabase.co/rest/v1/bot_storage";
     $sbKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InZxcHVydGluZHlhaXdqZ3JlcWR0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzM5MjA2NzksImV4cCI6MjA4OTQ5NjY3OX0.pRR7P3quZ7cX5EYZmHOxnx4C1gp9gMQuoMzNFa-lwM4";
-
     // ИСПРАВЛЕНИЕ: раздельное построение URL для GET
     if ($method === "GET") {
         if ($id) {
