@@ -40,6 +40,40 @@ function isAdmin($chatId, $userId) {
     return in_array($res['result']['status'] ?? '', ['administrator', 'creator']);
 }
 
+// --- API Groq (Распознавание голоса) ---
+function transcribeVoice($fileId, $token, $groqKey) {
+    // Получаем путь к файлу
+    $fileInfo = tgApi("getFile", ['file_id' => $fileId]);
+    if (!isset($fileInfo['result']['file_path'])) return "";
+    
+    $filePath = $fileInfo['result']['file_path'];
+    $fileUrl = "https://api.telegram.org/file/bot{$token}/{$filePath}";
+    
+    // Скачиваем файл во временную папку
+    $tmpFile = sys_get_temp_dir() . '/' . uniqid('voice_') . '.ogg';
+    file_put_contents($tmpFile, file_get_contents($fileUrl));
+    
+    // Отправляем в Groq Whisper
+    $ch = curl_init("https://api.groq.com/openai/v1/audio/transcriptions");
+    $cFile = new CURLFile($tmpFile, 'audio/ogg', 'voice.ogg');
+    $data = [
+        'file' => $cFile,
+        'model' => 'whisper-large-v3',
+        'response_format' => 'json'
+    ];
+    
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $data);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ["Authorization: Bearer $groqKey"]);
+    $res = curl_exec($ch);
+    curl_close($ch);
+    
+    unlink($tmpFile); // Удаляем временный файл
+    $result = json_decode($res, true);
+    return $result['text'] ?? "";
+}
+
 // ===================================================================
 // AI МОДЕРАТОР С РАССУЖДЕНИЕМ
 // ===================================================================
@@ -47,34 +81,35 @@ function aiCheckMessage($chatId, $text, $groqKey, $groqModel) {
     $db = getDb();
     $chatRules = $db['chats'][$chatId]['rules'] ?? null;
 
-    // Если правила не установлены — бот не работает
     if (!$chatRules) {
         return ['no_rules' => true];
     }
 
-    $systemPrompt = "Ты — ИИ-модератор. Твоя работа — сопоставлять текст с ПРАВИЛАМИ ЧАТА.
-    
-    ПРАВИЛА:
+    $systemPrompt = "Ты — строгий, но справедливый ИИ-модератор и судья чата. Твоя задача — анализировать сообщения пользователей (текст, расшифровку аудио, эмодзи стикеров) на строгое соответствие ПРАВИЛАМ ЧАТА.
+
+    ПРАВИЛА ЧАТА:
     \"$chatRules\"
 
-    ВАЖНО: 
-    - Маты разрешены, если они не являются частью оскорбления (буллинга) или грязи.
-    - Технический сленг (анрег, рега и т.д.) — это НЕ нарушение.
-    
+    ВАЖНЫЕ ИНСТРУКЦИИ:
+    1. Если нарушение явное (>= 50% угрозы): ставь высокий процент, указывай причину и действие (warn/mute/ban).
+    2. Если есть сомнения или ситуация неоднозначная (1-49% угрозы): бот не будет банить, но позовет админов. В поле 'ai_logic' проведи ГЛУБОКИЙ АНАЛИЗ (осуждение). Объясни, почему это может задеть участников или почему это серая зона.
+    3. Если правила на это действие нет — это НЕ нарушение (угроза 0%). Мы судим строго по своду правил.
+    4. Маты разрешены, если они не являются частью оскорбления, буллинга или грязи. Технический сленг разрешен.
+
     ОТВЕТЬ СТРОГО В JSON:
     {
         \"threat_percent\": (0-100),
         \"reason\": \"краткое пояснение нарушения\",
-        \"ai_logic\": \"твои рассуждения: почему ты сомневаешься или почему считаешь это нарушением\",
+        \"ai_logic\": \"максимально подробные рассуждения: анализ контекста, соответствие пунктам правил, сомнения\",
         \"suggested_action\": \"warn/mute/ban/none\",
-        \"mute_time\": (время в секундах, если это мут согласно правилам)
+        \"mute_time\": (время в секундах, если это мут согласно правилам, иначе 0)
     }";
 
     $data = [
         "model" => $groqModel,
         "messages" => [
             ["role" => "system", "content" => $systemPrompt],
-            ["role" => "user", "content" => "Текст сообщения: " . $text]
+            ["role" => "user", "content" => "Контент для анализа: " . $text]
         ],
         "temperature" => 0.2,
         "response_format" => ["type" => "json_object"]
@@ -101,53 +136,88 @@ if (!$msg) exit;
 
 $chatId = $msg['chat']['id'];
 $userId = $msg['from']['id'];
-$text = $msg['text'] ?? '';
-$msgId = $msg['message_id'];
+$msgId  = $msg['message_id'];
 $userName = $msg['from']['username'] ?? $msg['from']['first_name'];
 $targetId = $msg['reply_to_message']['from']['id'] ?? null;
 
+// Инициализация чата в БД
+$db = getDb();
+if (!isset($db['chats'][$chatId])) {
+    $db['chats'][$chatId] = ['rules' => '', 'is_active' => true];
+    saveDb($db);
+}
+
+// --- ИЗВЛЕЧЕНИЕ КОНТЕНТА ДЛЯ АНАЛИЗА ---
+$contentToAnalyze = '';
+
+if (isset($msg['text'])) {
+    $contentToAnalyze = "[Текст]: " . $msg['text'];
+} elseif (isset($msg['caption'])) {
+    $contentToAnalyze = "[Медиа с подписью]: " . $msg['caption'];
+} elseif (isset($msg['sticker'])) {
+    $contentToAnalyze = "[Стикер]: подразумевает эмодзи " . ($msg['sticker']['emoji'] ?? 'неизвестно');
+} elseif (isset($msg['voice'])) {
+    $transcription = transcribeVoice($msg['voice']['file_id'], $token, $groqKey);
+    $contentToAnalyze = "[Голосовое сообщение (расшифровка)]: " . ($transcription ?: "не удалось разобрать");
+}
+
 // --- КОМАНДЫ ---
-if (strpos($text, '/') === 0) {
+if (strpos($contentToAnalyze, '[Текст]: /') === 0) {
+    $text = $msg['text'];
     $parts = explode(' ', $text);
     $cmd = strtolower($parts[0]);
 
-    if ($cmd == '/set_rules' && isAdmin($chatId, $userId)) {
-        $rules = trim(str_replace('/set_rules', '', $text));
-        $db = getDb();
-        $db['chats'][$chatId]['rules'] = $rules;
-        saveDb($db);
-        tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "✅ <b>Правила Кодекса приняты!</b> теперь я на страже.", 'parse_mode' => 'HTML']);
-        exit;
-    }
-    
-    // Ручные команды (реплаем)
-    if ($targetId && isAdmin($chatId, $userId)) {
-        if ($cmd == '/mute') {
-            $time = (int)($parts[1] ?? 60);
-            tgApi("restrictChatMember", ['chat_id' => $chatId, 'user_id' => $targetId, 'until_date' => time() + ($time * 60), 'permissions' => json_encode(['can_send_messages' => false])]);
-            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🔇 Мут на $time мин."]);
+    if (isAdmin($chatId, $userId)) {
+        // Настройка правил
+        if ($cmd == '/set_rules') {
+            $rules = trim(str_replace('/set_rules', '', $text));
+            $db['chats'][$chatId]['rules'] = $rules;
+            saveDb($db);
+            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "✅ <b>Правила Кодекса приняты!</b>", 'parse_mode' => 'HTML']);
+            exit;
         }
-        if ($cmd == '/ban') {
-            tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $targetId]);
+        
+        // Включение / Выключение бота
+        if ($cmd == '/bot_on') {
+            $db['chats'][$chatId]['is_active'] = true;
+            saveDb($db);
+            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "👁 <b>ИИ-Модератор активирован.</b> Я слежу за порядком.", 'parse_mode' => 'HTML']);
+            exit;
         }
-        if ($cmd == '/unmute' || $cmd == '/unban') {
-            tgApi("restrictChatMember", ['chat_id' => $chatId, 'user_id' => $targetId, 'permissions' => json_encode(['can_send_messages'=>true,'can_send_media_messages'=>true,'can_send_other_messages'=>true,'can_add_web_page_previews'=>true])]);
-            tgApi("unbanChatMember", ['chat_id' => $chatId, 'user_id' => $targetId, 'only_if_banned' => true]);
+        if ($cmd == '/bot_off') {
+            $db['chats'][$chatId]['is_active'] = false;
+            saveDb($db);
+            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "💤 <b>ИИ-Модератор деактивирован.</b> Ухожу в спящий режим.", 'parse_mode' => 'HTML']);
+            exit;
+        }
+
+        // Ручные команды (реплаем)
+        if ($targetId) {
+            if ($cmd == '/mute') {
+                $time = (int)($parts[1] ?? 60);
+                tgApi("restrictChatMember", ['chat_id' => $chatId, 'user_id' => $targetId, 'until_date' => time() + ($time * 60), 'permissions' => json_encode(['can_send_messages' => false])]);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🔇 Мут на $time мин."]);
+            }
+            if ($cmd == '/ban') {
+                tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $targetId]);
+            }
+            if ($cmd == '/unmute' || $cmd == '/unban') {
+                tgApi("restrictChatMember", ['chat_id' => $chatId, 'user_id' => $targetId, 'permissions' => json_encode(['can_send_messages'=>true,'can_send_media_messages'=>true,'can_send_other_messages'=>true,'can_add_web_page_previews'=>true])]);
+                tgApi("unbanChatMember", ['chat_id' => $chatId, 'user_id' => $targetId, 'only_if_banned' => true]);
+            }
         }
     }
     exit;
 }
 
 // --- АВТО-ПРОВЕРКА ---
-if (isAdmin($chatId, $userId)) exit;
+// Если бот выключен или пишет админ / нет текста — выходим
+if (!$db['chats'][$chatId]['is_active'] || isAdmin($chatId, $userId) || empty($contentToAnalyze)) exit;
 
-$res = aiCheckMessage($chatId, $text, $groqKey, $groqModel);
+$res = aiCheckMessage($chatId, $contentToAnalyze, $groqKey, $groqModel);
 
 // 1. Если правил нет
-if (isset($res['no_rules'])) {
-    // Бот молчит или может один раз напомнить админу (лучше молчать, чтобы не спамить)
-    exit;
-}
+if (isset($res['no_rules'])) exit;
 
 $threat = $res['threat_percent'] ?? 0;
 
@@ -158,7 +228,7 @@ if ($threat >= 50) {
     $action = $res['suggested_action'] ?? 'warn';
     $reason = $res['reason'] ?? "Нарушение кодекса";
     
-    if ($action == 'mute' && isset($res['mute_time'])) {
+    if ($action == 'mute' && !empty($res['mute_time'])) {
         tgApi("restrictChatMember", [
             'chat_id' => $chatId, 
             'user_id' => $userId, 
@@ -173,8 +243,7 @@ if ($threat >= 50) {
         $info = "удалено. Причина: $reason";
     }
 
-    tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🛡 <b>Кодекс Хаты:</b> Сообщение @$userName $info", 'parse_mode' => 'HTML']);
-
+    tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🛡 <b>Кодекс Хаты:</b> Сообщение @$userName $info\n\n🧠 <b>Анализ ИИ:</b> <i>{$res['ai_logic']}</i>", 'parse_mode' => 'HTML']);
 } 
 // 3. Если угроза средняя (от 1% до 49%) — рассуждаем и зовем админов
 elseif ($threat > 0) {
@@ -184,10 +253,10 @@ elseif ($threat > 0) {
     tgApi("sendMessage", [
         'chat_id' => $chatId,
         'reply_to_message_id' => $msgId,
-        'text' => "🧐 <b>ИИ в раздумьях (Угроза {$threat}%)</b>\n\n" .
+        'text' => "🧐 <b>ИИ сомневается (Угроза {$threat}%)</b>\n\n" .
                   "📌 <b>Вердикт:</b> {$reason}\n" .
-                  "🧠 <b>Рассуждение:</b> <i>{$logic}</i>\n\n" .
-                  "⚠️ Администрация, взгляните.",
+                  "⚖️ <b>Подробный разбор:</b> <i>{$logic}</i>\n\n" .
+                  "⚠️ @admin, взгляните. Правила задеты по касательной или это серая зона.",
         'parse_mode' => 'HTML'
     ]);
 }
