@@ -5,7 +5,7 @@ error_reporting(0);
 
 $token   = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0";
 $adminId = 7640692963;
-$api     = "[api.telegram.org](https://api.telegram.org/bot$token)";
+$api     = "api.telegram.org https://api.telegram.org/bot$token";
 $version = "2.8.0";
 
 // Groq API — самый быстрый бесплатный LLM (~200-400ms)
