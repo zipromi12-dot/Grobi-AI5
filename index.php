@@ -4,38 +4,45 @@ ini_set('display_errors', 1);
 error_reporting(E_ALL);
 
 $token   = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0";
-$adminId = 7640692963; // Твой ID (тебя бот наказывать не будет)
+$adminId = 7640692963; // Твой ID (Абсолютный админ, бот игнорирует его нарушения)
 $api     = "https://api.telegram.org/bot" . $token;
 
-// Groq API (Ключ и Модель)
+// Groq API
 $groqKey   = "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";
 $groqModel = "llama-3.1-8b-instant";
 
 // ===================================================================
-// БАЗА ДАННЫХ (Локальный JSON файл для хранения предупреждений)
+// БАЗА ДАННЫХ (Хранение правил чатов и предупреждений)
 // ===================================================================
-
 $dbFile = 'database.json';
 
-// Функция получения базы
 function getDb() {
     global $dbFile;
     if (!file_exists($dbFile)) {
-        file_put_contents($dbFile, json_encode(['users' => []]));
+        file_put_contents($dbFile, json_encode(['chats' => []]));
     }
     return json_decode(file_get_contents($dbFile), true);
 }
 
-// Функция сохранения в базу
 function saveDb($data) {
     global $dbFile;
-    file_put_contents($dbFile, json_encode($data, JSON_PRETTY_PRINT));
+    file_put_contents($dbFile, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+}
+
+function getChatRules($chatId) {
+    $db = getDb();
+    return $db['chats'][$chatId]['rules'] ?? "Специфичных правил нет. Следуйте базовым правилам адекватного общения.";
+}
+
+function setChatRules($chatId, $rules) {
+    $db = getDb();
+    $db['chats'][$chatId]['rules'] = $rules;
+    saveDb($db);
 }
 
 // ===================================================================
 // ОСНОВНЫЕ ФУНКЦИИ TELEGRAM
 // ===================================================================
-
 function tgApi($method, $data = []) {
     global $api;
     $ch = curl_init($api . '/' . $method);
@@ -48,37 +55,86 @@ function tgApi($method, $data = []) {
     return json_decode($res, true);
 }
 
+// Проверка, является ли пользователь админом в чате
+function isAdmin($chatId, $userId) {
+    global $adminId;
+    if ($userId == $adminId) return true;
+    
+    $admins = tgApi("getChatAdministrators", ['chat_id' => $chatId]);
+    if (isset($admins['ok']) && $admins['ok']) {
+        foreach ($admins['result'] as $admin) {
+            if ($admin['user']['id'] == $userId) return true;
+        }
+    }
+    return false;
+}
+
+// Тегнуть всех админов
+function pingAdmins($chatId, $msgId, $reason, $recommendation, $threat) {
+    $admins = tgApi("getChatAdministrators", ['chat_id' => $chatId]);
+    $tags = "";
+    if (isset($admins['ok']) && $admins['ok']) {
+        foreach ($admins['result'] as $admin) {
+            if (!$admin['user']['is_bot'] && isset($admin['user']['username'])) {
+                $tags .= "@" . $admin['user']['username'] . " ";
+            }
+        }
+    }
+    
+    $text = "🛡 <b>Внимание Администрации!</b>\n"
+          . "ИИ сомневается, но заметил подозрительное сообщение.\n\n"
+          . "📊 <b>Угроза:</b> {$threat}%\n"
+          . "📌 <b>Причина:</b> {$reason}\n"
+          . "💡 <b>Рекомендация ИИ:</b> {$recommendation}\n\n"
+          . "👤 Позовите админов: " . $tags;
+
+    tgApi("sendMessage", [
+        'chat_id' => $chatId,
+        'reply_to_message_id' => $msgId,
+        'text' => $text,
+        'parse_mode' => 'HTML'
+    ]);
+}
+
 // ===================================================================
 // AI МОДЕРАТОР
 // ===================================================================
+function aiCheckMessage($chatId, $text, $groqKey, $groqModel) {
+    if (mb_strlen(trim($text)) < 2) return ['threat_percent' => 0];
 
-function aiCheckMessage($text, $groqKey, $groqModel) {
-    // Игнорируем совсем короткие сообщения
-    if (mb_strlen(trim($text)) < 2) return ['violation' => false];
+    $chatRules = getChatRules($chatId);
 
-    // Промпт для ИИ
-    $systemPrompt = "Ты — автоматическая система безопасности чата. 
-    Твоя цель: выявлять нарушения правил.
-    КАТЕГОРИИ НАРУШЕНИЙ:
-    1. Мат, нецензурная лексика, скрытый мат (например: п*здец, х**).
-    2. Оскорбления участников, агрессия, токсичность.
-    3. Реклама, ссылки на другие каналы, спам.
-    4. Угрозы физической расправой.
+    $systemPrompt = "Ты — строгий и беспристрастный ИИ-модератор Telegram-чата.
+    
+    ПРАВИЛА ЧАТА:
+    $chatRules
+    
+    БАЗОВЫЕ ПРАВИЛА (действуют всегда):
+    1. ЖЕСТКИЙ ЗАПРЕТ НА МАТ. Любое матерное слово, скрытый мат (звездочки), мат для связки слов или эмоций — это нарушение.
+    2. Запрещены оскорбления, токсичность, буллинг.
+    3. Запрещены спам, реклама, шок-контент, порнография, угрозы.
 
-    ОПРЕДЕЛЕНИЕ ТЯЖЕСТИ (severity):
-    1 - Легкое нарушение (мат, спам, токсичность).
-    3 - Жесткое нарушение (прямые угрозы, шок-контент, массированная реклама).
+    Твоя задача — проанализировать сообщение и оценить уровень угрозы (threat_percent) от 0 до 100.
+    - 0%: Абсолютно чистое сообщение.
+    - 10-49%: Мелкие нарушения, грубость, подозрение на спам, спорная ситуация.
+    - 50-100%: Явный мат, оскорбления, реклама, угрозы (Требует автоматического наказания).
 
-    ОТВЕЧАЙ СТРОГО В ФОРМАТЕ JSON:
-    {\"violation\": true/false, \"reason\": \"короткая причина на русском\", \"severity\": 1 или 3}";
+    ОТВЕЧАЙ СТРОГО В JSON ФОРМАТЕ, без лишнего текста:
+    {
+        \"threat_percent\": число от 0 до 100,
+        \"reason\": \"короткая причина на русском\",
+        \"severity\": 1 (варн), 2 (мут) или 3 (бан),
+        \"suggested_action\": \"строка: warn, mute или ban\"
+    }";
 
     $data = [
         "model" => $groqModel,
         "messages" => [
             ["role" => "system", "content" => $systemPrompt],
-            ["role" => "user", "content" => "Текст сообщения: " . $text]
+            ["role" => "user", "content" => "Текст: " . $text]
         ],
-        "temperature" => 0 // Чтобы бот не фантазировал
+        "temperature" => 0.1,
+        "response_format" => ["type" => "json_object"] // Принудительный JSON
     ];
 
     $ch = curl_init("https://api.groq.com/openai/v1/chat/completions");
@@ -90,58 +146,47 @@ function aiCheckMessage($text, $groqKey, $groqModel) {
     $res = curl_exec($ch);
     curl_close($ch);
 
-    // Умный поиск JSON в ответе ИИ
-    if (preg_match('/\{.*\}/s', $res, $matches)) {
-        $json = json_decode($matches[0], true);
-        if (isset($json['choices'][0]['message']['content'])) {
-            $content = $json['choices'][0]['message']['content'];
-            if (preg_match('/\{.*\}/s', $content, $m)) {
-                return json_decode($m[0], true);
-            }
-        }
+    $json = json_decode($res, true);
+    if (isset($json['choices'][0]['message']['content'])) {
+        $content = $json['choices'][0]['message']['content'];
+        return json_decode($content, true);
     }
-    return ['violation' => false];
+    
+    return ['threat_percent' => 0];
 }
 
-// Функция выдачи наказаний с учетом истории пользователя
-function enforcePunishment($chatId, $userId, $userName, $messageId, $reason, $severity) {
-    // 1. Сразу удаляем плохое сообщение
-    tgApi("deleteMessage", ['chat_id' => $chatId, 'message_id' => $messageId]);
+function enforcePunishment($chatId, $userId, $userName, $msgId, $reason, $severity, $action) {
+    // Удаляем сообщение
+    tgApi("deleteMessage", ['chat_id' => $chatId, 'message_id' => $msgId]);
 
-    // 2. Получаем базу данных
     $db = getDb();
-    if (!isset($db['users'][$userId])) {
-        $db['users'][$userId] = ['warns' => 0];
+    if (!isset($db['chats'][$chatId]['users'][$userId])) {
+        $db['chats'][$chatId]['users'][$userId] = ['warns' => 0];
     }
 
-    // Если ИИ решил, что это жесть (severity 3) — баним мгновенно
-    if ($severity == 3) {
+    if ($action == 'ban' || $severity == 3) {
         tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $userId]);
         tgApi("sendMessage", [
             'chat_id' => $chatId, 
-            'text' => "⛔ @$userName <b>ЗАБЛОКИРОВАН НАВСЕГДА.</b>\n📌 Причина: Грубое нарушение ($reason)",
+            'text' => "⛔ @$userName <b>ЗАБЛОКИРОВАН (Auto-Ban).</b>\n📌 Причина: $reason",
             'parse_mode' => 'HTML'
         ]);
         return;
     }
 
-    // Иначе добавляем +1 предупреждение (severity 1)
-    $db['users'][$userId]['warns'] += 1;
-    $warns = $db['users'][$userId]['warns'];
+    // Добавляем варн
+    $db['chats'][$chatId]['users'][$userId]['warns'] += 1;
+    $warns = $db['chats'][$chatId]['users'][$userId]['warns'];
     saveDb($db);
 
-    // ЭСКАЛАЦИЯ НАКАЗАНИЙ:
     if ($warns == 1) {
-        // Первый раз — просто предупреждение
         tgApi("sendMessage", [
             'chat_id' => $chatId, 
-            'text' => "⚠️ @$userName, ваше сообщение удалено.\n📌 Причина: $reason\n❗️ Это ваше <b>1-е предупреждение (из 3)</b>.",
+            'text' => "⚠️ @$userName, сообщение удалено.\n📌 Причина: $reason\n❗️ Предупреждение <b>1 из 3</b>.",
             'parse_mode' => 'HTML'
         ]);
-
     } elseif ($warns == 2) {
-        // Второй раз — Мут на 1 час
-        $until = time() + 3600; // Мут на 1 час (3600 секунд)
+        $until = time() + 3600; // Мут на час
         tgApi("restrictChatMember", [
             'chat_id' => $chatId,
             'user_id' => $userId,
@@ -150,21 +195,17 @@ function enforcePunishment($chatId, $userId, $userName, $messageId, $reason, $se
         ]);
         tgApi("sendMessage", [
             'chat_id' => $chatId, 
-            'text' => "🔇 @$userName, вы получаете <b>МУТ НА 1 ЧАС</b>.\n📌 Причина: $reason\n❗️ Предупреждений: <b>2 из 3</b>. Следующее нарушение приведет к бану.",
+            'text' => "🔇 @$userName получает <b>МУТ НА 1 ЧАС</b>.\n📌 Причина: $reason\n❗️ Предупреждение <b>2 из 3</b>.",
             'parse_mode' => 'HTML'
         ]);
-
-    } elseif ($warns >= 3) {
-        // Третий раз — БАН
+    } else {
         tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $userId]);
         tgApi("sendMessage", [
             'chat_id' => $chatId, 
-            'text' => "⛔ @$userName заблокирован в чате.\n📌 Причина: Лимит нарушений превышен (3/3).",
+            'text' => "⛔ @$userName заблокирован.\n📌 Причина: Лимит нарушений (3/3).",
             'parse_mode' => 'HTML'
         ]);
-        
-        // Сбрасываем счетчик после бана (на случай если админ потом разбанит)
-        $db['users'][$userId]['warns'] = 0;
+        $db['chats'][$chatId]['users'][$userId]['warns'] = 0;
         saveDb($db);
     }
 }
@@ -172,7 +213,6 @@ function enforcePunishment($chatId, $userId, $userName, $messageId, $reason, $se
 // ===================================================================
 // ОБРАБОТКА ОБНОВЛЕНИЙ
 // ===================================================================
-
 $update = json_decode(file_get_contents("php://input"), true);
 if (!$update || !isset($update['message'])) {
     http_response_code(200);
@@ -187,63 +227,151 @@ $text = $msg['text'] ?? '';
 $msgId = $msg['message_id'];
 $userName = $msg['from']['username'] ?? $msg['from']['first_name'];
 
+// Цель для админ-команд (если реплай)
+$targetId = $msg['reply_to_message']['from']['id'] ?? null;
+$targetName = $msg['reply_to_message']['from']['username'] ?? $msg['reply_to_message']['from']['first_name'] ?? 'User';
+
 // ===================================================================
-// КОМАНДЫ ДЛЯ АДМИНА
+// КОМАНДЫ АДМИНИСТРАТОРА
 // ===================================================================
 if (strpos($text, '/') === 0) {
     $parts = explode(' ', $text);
     $cmd = strtolower($parts[0]);
 
-    if ($cmd == '/testai' && $userId == $adminId) {
-        tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "⏳ Тестирую ИИ..."]);
-        $testRes = aiCheckMessage("Ты дурак и урод!", $groqKey, $groqModel);
-        tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🤖 Ответ ИИ: \n<pre>" . print_r($testRes, true) . "</pre>", 'parse_mode' => 'HTML']);
+    // Просмотр правил (доступно всем)
+    if ($cmd == '/rules') {
+        $rules = getChatRules($chatId);
+        tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "📜 <b>Правила чата:</b>\n\n$rules", 'parse_mode' => 'HTML']);
         exit;
     }
 
-    if ($cmd == '/unwarn' && $userId == $adminId) {
-        // Прощаем пользователя (сбрасываем варны)
-        $targetId = null;
-        if (isset($msg['reply_to_message'])) {
-            $targetId = $msg['reply_to_message']['from']['id'];
-        } elseif (isset($parts[1]) && is_numeric($parts[1])) {
-            $targetId = $parts[1];
+    // Все что ниже - только для админов
+    if (isAdmin($chatId, $userId)) {
+        
+        // --- Настройка правил ---
+        if ($cmd == '/set_rules') {
+            $newRules = trim(mb_substr($text, 10));
+            if ($newRules == "") {
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "❌ Укажите правила после команды.\nПример: /set_rules 1. Без спама 2. Без ссылок"]);
+            } else {
+                setChatRules($chatId, $newRules);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "✅ Правила чата успешно обновлены!"]);
+            }
+            exit;
         }
 
-        if ($targetId) {
-            $db = getDb();
-            $db['users'][$targetId]['warns'] = 0;
-            saveDb($db);
-            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "✅ Предупреждения пользователя сброшены до 0."]);
-        } else {
-            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "❌ Ответьте на сообщение пользователя или укажите ID: /unwarn [id]"]);
+        // --- Тест ИИ ---
+        if ($cmd == '/testai') {
+            $testText = trim(mb_substr($text, 7)) ?: "тест";
+            $res = aiCheckMessage($chatId, $testText, $groqKey, $groqModel);
+            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🤖 <b>Тест ИИ:</b>\n<pre>" . print_r($res, true) . "</pre>", 'parse_mode' => 'HTML']);
+            exit;
         }
-        exit;
+
+        // Для команд ниже нужен $targetId (реплай)
+        if (!$targetId && in_array($cmd, ['/ban', '/kick', '/mute', '/unmute', '/warn', '/unwarn'])) {
+            tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "❌ Сделайте Reply (ответ) на сообщение пользователя!"]);
+            exit;
+        }
+
+        switch ($cmd) {
+            case '/ban':
+                tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $targetId]);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🔨 @$targetName забанен администратором."]);
+                break;
+
+            case '/unban':
+                tgApi("unbanChatMember", ['chat_id' => $chatId, 'user_id' => $targetId, 'only_if_banned' => true]);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🕊 @$targetName разбанен."]);
+                break;
+
+            case '/kick':
+                tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $targetId]);
+                tgApi("unbanChatMember", ['chat_id' => $chatId, 'user_id' => $targetId]);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "👢 @$targetName кикнут из чата (может вернуться)."]);
+                break;
+
+            case '/mute':
+                $minutes = isset($parts[1]) ? (int)$parts[1] : 60;
+                $until = time() + ($minutes * 60);
+                tgApi("restrictChatMember", [
+                    'chat_id' => $chatId,
+                    'user_id' => $targetId,
+                    'until_date' => $until,
+                    'permissions' => json_encode(['can_send_messages' => false])
+                ]);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🔇 @$targetName отправлен в мут на $minutes минут."]);
+                break;
+
+            case '/unmute':
+                tgApi("restrictChatMember", [
+                    'chat_id' => $chatId,
+                    'user_id' => $targetId,
+                    'permissions' => json_encode([
+                        'can_send_messages' => true,
+                        'can_send_media_messages' => true,
+                        'can_send_other_messages' => true,
+                        'can_add_web_page_previews' => true
+                    ])
+                ]);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🔊 Мут с @$targetName снят."]);
+                break;
+
+            case '/warn':
+                $db = getDb();
+                if (!isset($db['chats'][$chatId]['users'][$targetId])) $db['chats'][$chatId]['users'][$targetId] = ['warns' => 0];
+                $db['chats'][$chatId]['users'][$targetId]['warns'] += 1;
+                $warns = $db['chats'][$chatId]['users'][$targetId]['warns'];
+                saveDb($db);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "⚠️ @$targetName получил предупреждение ($warns/3) от администратора."]);
+                if ($warns >= 3) {
+                     tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $targetId]);
+                     tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "⛔ @$targetName забанен за 3 предупреждения."]);
+                     $db['chats'][$chatId]['users'][$targetId]['warns'] = 0;
+                     saveDb($db);
+                }
+                break;
+
+            case '/unwarn':
+                $db = getDb();
+                $db['chats'][$chatId]['users'][$targetId]['warns'] = 0;
+                saveDb($db);
+                tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "✅ Предупреждения @$targetName сброшены до 0."]);
+                break;
+        }
     }
-    
-    // Если это любая другая команда, просто выходим, ИИ команды не проверяет
     exit;
 }
 
 // ===================================================================
-// АВТОМАТИЧЕСКАЯ AI-ПРОВЕРКА
+// АВТОМАТИЧЕСКАЯ AI-ПРОВЕРКА (Если это не команда)
 // ===================================================================
 
-// Игнорируем админа (тебя)
-if ($userId == $adminId) {
+// Игнорируем админов
+if (isAdmin($chatId, $userId)) {
+    http_response_code(200);
+    echo "OK";
     exit;
 }
 
-// Отправляем сообщение в нейросеть
-$verdict = aiCheckMessage($text, $groqKey, $groqModel);
+// Проверка через Groq
+$verdict = aiCheckMessage($chatId, $text, $groqKey, $groqModel);
+$threat = $verdict['threat_percent'] ?? 0;
 
-// Если ИИ нашел нарушение
-if (isset($verdict['violation']) && $verdict['violation'] === true) {
-    $reason = $verdict['reason'] ?? "Нарушение правил";
+if ($threat >= 50) {
+    // Явная угроза -> Автоматическое наказание
+    $reason = $verdict['reason'] ?? "Грубое нарушение правил";
     $severity = $verdict['severity'] ?? 1;
+    $action = $verdict['suggested_action'] ?? 'warn';
+    
+    enforcePunishment($chatId, $userId, $userName, $msgId, $reason, $severity, $action);
 
-    // Запускаем систему наказаний
-    enforcePunishment($chatId, $userId, $userName, $messageId, $reason, $severity);
+} elseif ($threat > 0 && $threat < 50) {
+    // Сомнительная ситуация -> Пингуем админов
+    $reason = $verdict['reason'] ?? "Подозрительное поведение";
+    $action = $verdict['suggested_action'] ?? 'Проверить вручную';
+    
+    pingAdmins($chatId, $msgId, $reason, $action, $threat);
 }
 
 // Завершаем скрипт корректно
