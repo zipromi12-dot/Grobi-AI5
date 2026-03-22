@@ -5,7 +5,7 @@ $token   = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0";
 $adminId = 7640692963; 
 $api     = "https://api.telegram.org/bot" . $token;
 
-$groqKey   = "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";
+$groqKey   = "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";
 $groqModel = "llama-3.1-8b-instant";
 $dbFile    = 'database.json';
 
