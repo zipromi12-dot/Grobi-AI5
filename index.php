@@ -1,27 +1,27 @@
 <?php
 // ==========================================
-// ⚙️ ОСНОВНЫЕ НАСТРОЙКИ 
+// ⚙️ КОНФИГУРАЦИЯ
 // ==========================================
-ini_set('display_errors', 0); // Скрываем ошибки PHP для стабильного вебхука
+ini_set('display_errors', 0); 
 
 $token        = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0"; 
-$adminId      = 7640692963; // ТВОЙ_ЛИЧНЫЙ_ID (сюда летят подробные логи ошибок)
-$adminGroupId = "-1003812180726"; // ID ГРУППЫ АДМИНОВ (сюда летят репорты с кнопками)
+$adminId      = 123456789; // ТВОЙ ЛИЧНЫЙ ID (для полных логов)
+$adminGroupId = "-1003812180726"; // ID ГРУППЫ АДМИНОВ (для репортов)
 
-$geminiKey    = "AIzaSyANstszxxWi1AYgZvAPpQc_gQsjuPjRbBc"; // Основной ИИ (Видит фото)
-$groqKey      = "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";   // Резервный ИИ (Только текст)
+$geminiKey    = "AIzaSyANstszxxWi1AYgZvAPpQc_gQsjuPjRbBc"; 
+$groqKey      = "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";
 
 $api          = "https://api.telegram.org/bot" . $token;
 $dbFile       = 'database.json';
 
 // ==========================================
-// 🗄 БАЗА ДАННЫХ И ИСТОРИЯ
+// 🗄 РАБОТА С БД И ИСТОРИЕЙ
 // ==========================================
 function getDb() {
     global $dbFile;
     if (!file_exists($dbFile)) file_put_contents($dbFile, json_encode(['chats' => []]));
-    $data = json_decode(file_get_contents($dbFile), true);
-    return is_array($data) ? $data : ['chats' => []];
+    $res = json_decode(file_get_contents($dbFile), true);
+    return is_array($res) ? $res : ['chats' => []];
 }
 
 function saveDb($data) {
@@ -39,7 +39,7 @@ function addHistory($chatId, $userName, $text) {
 }
 
 // ==========================================
-// 📡 TELEGRAM API И ЛОГИРОВАНИЕ
+// 📡 ТЕЛЕГРАМ API И ЛОГИ
 // ==========================================
 function tgApi($method, $data = []) {
     global $api;
@@ -48,27 +48,21 @@ function tgApi($method, $data = []) {
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
     $res = curl_exec($ch);
-    $error = curl_error($ch);
     curl_close($ch);
-    
-    if ($error) logBotError("Ошибка сети с Telegram.", "cURL Error ($method): $error");
     return json_decode($res, true);
 }
 
-// Логирование: Коротко в админку, подробно разработчику в ЛС
 function logBotError($shortMsg, $detailedMsg) {
     global $adminId, $adminGroupId;
+    // Подробный лог тебе в личку
     tgApi("sendMessage", [
         'chat_id' => $adminId,
         'text' => "🔴 <b>СИСТЕМНАЯ ОШИБКА:</b>\n\n<pre>".htmlspecialchars($detailedMsg)."</pre>",
         'parse_mode' => 'HTML'
     ]);
+    // Короткое уведомление админам
     if (!empty($adminGroupId)) {
-        tgApi("sendMessage", [
-            'chat_id' => $adminGroupId,
-            'text' => "⚠️ <b>Внимание:</b> $shortMsg",
-            'parse_mode' => 'HTML'
-        ]);
+        tgApi("sendMessage", ['chat_id' => $adminGroupId, 'text' => "⚠️ <b>Система:</b> $shortMsg", 'parse_mode' => 'HTML']);
     }
 }
 
@@ -79,12 +73,6 @@ function isAdmin($chatId, $userId) {
     return in_array($res['result']['status'] ?? '', ['administrator', 'creator']);
 }
 
-function getMessageLink($chatId, $msgId) {
-    $cleanChatId = str_replace('-100', '', (string)$chatId);
-    return "https://t.me/c/{$cleanChatId}/{$msgId}";
-}
-
-// Скачивание файлов (фото/стикеры)
 function getFileBase64($fileId, $token) {
     $fileInfo = tgApi("getFile", ['file_id' => $fileId]);
     if (!isset($fileInfo['result']['file_path'])) return null;
@@ -96,50 +84,49 @@ function getFileBase64($fileId, $token) {
 }
 
 // ==========================================
-// 🧠 ИСКУССТВЕННЫЙ ИНТЕЛЛЕКТ (Gemini + Groq)
+// 🧠 НЕУБИВАЕМЫЙ ИИ (Gemini + Groq)
 // ==========================================
 function aiCheckMessage($chatId, $text, $imageData = null, $contextText = "") {
     global $geminiKey, $groqKey;
     
-    // 1. Пытаемся спросить основной ИИ (Gemini)
+    // 1. Пытаемся Gemini
     $res = callGemini($chatId, $text, $geminiKey, $imageData, $contextText);
     $usedGroq = false;
     
-    // 2. Если Gemini упал (404, лимиты, ошибка сети) -> переключаемся на Groq
+    // 2. Если Gemini выдал ошибку (любую) -> Groq
     if (isset($res['error'])) {
-        logBotError("Gemini недоступен, переключился на Groq", "Gemini Error: " . $res['error']);
+        logBotError("Gemini Error", $res['error']);
         $res = callGroq($chatId, $text, $groqKey, $contextText);
         $usedGroq = true;
     }
     
     // 3. Если и Groq упал
     if (isset($res['error'])) {
-        logBotError("ОБА ИИ УПАЛИ!", "Groq Error: " . $res['error']);
-        return ['threat_percent' => 0, 'reason' => 'Системная ошибка ИИ', 'ai_logic' => 'AI unavailable', 'suggested_action' => 'none', 'used_groq' => false];
+        logBotError("ОБА ИИ УПАЛИ", "Groq Error: " . $res['error']);
+        return ['threat_percent' => 0, 'reason' => 'AI_OFF', 'ai_logic' => 'Offline', 'suggested_action' => 'none', 'used_groq' => false];
     }
     
-    $res['used_groq'] = $usedGroq; // Флаг для админки
+    $res['used_groq'] = $usedGroq;
     return $res;
 }
 
 function callGemini($chatId, $text, $key, $imageData, $context) {
-    $db = getDb();
-    $chatRules = $db['chats'][$chatId]['rules'] ?? "Без спама, ЦП и прямого оскорбления.";
+    // Используем v1beta, но в упрощенном формате без systemInstruction
+    $url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" . $key;
     
-    $systemPrompt = "Ты ИИ модератор. Мат разрешен, если это эмоции. Запрещены прямые оскорбления, травля, NSFW. Кодекс чата: $chatRules. Отвечай строго JSON: {\"threat_percent\": 0-100, \"reason\": \"причина\", \"ai_logic\": \"логика\", \"suggested_action\": \"none/warn/mute/ban\"}";
-    
-    // Исправленный стабильный URL Gemini
-    $url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=" . $key;
-    
-    $parts = [["text" => "Контент: $text.\nКонтекст переписки: $context"]];
+    $prompt = "Ты ИИ Модератор. ПРАВИЛА: мат разрешен если не оскорбление, NSFW/ЦП запрещено. \n"
+            . "Контекст диалога:\n$context \n\n"
+            . "Проанализируй сообщение: $text \n\n"
+            . "Ответь ТОЛЬКО в формате JSON: {\"threat_percent\": 0-100, \"reason\": \"причина\", \"ai_logic\": \"логика\", \"suggested_action\": \"none/warn/mute/ban\"}";
+
+    $parts = [["text" => $prompt]];
     if ($imageData) {
         $parts[] = ["inline_data" => ["mime_type" => $imageData['mime'], "data" => $imageData['data']]];
     }
 
     $payload = [
         "contents" => [["parts" => $parts]],
-        "systemInstruction" => ["parts" => [["text" => $systemPrompt]]],
-        "generationConfig" => ["response_mime_type" => "application/json", "temperature" => 0.2]
+        "generationConfig" => ["temperature" => 0.1]
     ];
 
     $ch = curl_init($url);
@@ -151,29 +138,29 @@ function callGemini($chatId, $text, $key, $imageData, $context) {
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if ($httpCode != 200) return ['error' => "HTTP $httpCode: $response"];
+    if ($httpCode != 200) return ['error' => "Gemini HTTP $httpCode: $response"];
 
     $result = json_decode($response, true);
-    $json = $result['candidates'][0]['content']['parts'][0]['text'] ?? '{}';
-    return json_decode($json, true);
+    $rawText = $result['candidates'][0]['content']['parts'][0]['text'] ?? '{}';
+    $cleanJson = trim(str_replace(['```json', '```'], '', $rawText));
+    $parsed = json_decode($cleanJson, true);
+    
+    return is_array($parsed) ? $parsed : ['error' => "Invalid JSON from Gemini: $rawText"];
 }
 
 function callGroq($chatId, $text, $key, $context) {
-    $db = getDb();
-    $chatRules = $db['chats'][$chatId]['rules'] ?? "Без спама и прямого оскорбления.";
-    
-    $systemPrompt = "You are a chat moderator. Chat rules: $chatRules. Context of dialogue: $context. Reply strictly in JSON format: {\"threat_percent\": 0-100, \"reason\": \"short reason in russian\", \"ai_logic\": \"logic in russian\", \"suggested_action\": \"none/warn/mute/ban\"}";
-    
+    // Новая модель llama-3.3-70b-versatile
+    $url = "https://api.groq.com/openai/v1/chat/completions";
     $payload = [
-        "model" => "llama3-70b-8192",
+        "model" => "llama-3.3-70b-versatile",
         "messages" => [
-            ["role" => "system", "content" => $systemPrompt],
-            ["role" => "user", "content" => "Analyze this message: $text"]
+            ["role" => "system", "content" => "You are a chat moderator. Reply ONLY JSON: {\"threat_percent\": 0-100, \"reason\": \"ru_text\", \"ai_logic\": \"ru_text\", \"suggested_action\": \"none\"}"],
+            ["role" => "user", "content" => "Context: $context\n\nAnalyze: $text"]
         ],
         "response_format" => ["type" => "json_object"]
     ];
 
-    $ch = curl_init("https://api.groq.com/openai/v1/chat/completions");
+    $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_HTTPHEADER, ["Authorization: Bearer $key", "Content-Type: application/json"]);
     curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -182,7 +169,7 @@ function callGroq($chatId, $text, $key, $context) {
     $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
-    if ($httpCode != 200) return ['error' => "HTTP $httpCode: $response"];
+    if ($httpCode != 200) return ['error' => "Groq HTTP $httpCode: $response"];
 
     $result = json_decode($response, true);
     $json = $result['choices'][0]['message']['content'] ?? '{}';
@@ -192,32 +179,25 @@ function callGroq($chatId, $text, $key, $context) {
 // ==========================================
 // 🛡 ОТПРАВКА РЕПОРТА АДМИНАМ
 // ==========================================
-function sendReportToAdmin($chatId, $targetId, $targetMsgId, $targetName, $targetText, $aiResult, $isManualReport = false) {
+function sendReportToAdmin($chatId, $targetId, $targetMsgId, $targetName, $targetText, $aiRes, $isManual = false) {
     global $adminGroupId;
     
-    $btnDataBan  = "ban|{$targetId}|{$chatId}|{$targetMsgId}";
-    $btnDataMute = "mute|{$targetId}|{$chatId}|{$targetMsgId}";
-    $btnDataWarn = "warn|{$targetId}|{$chatId}|{$targetMsgId}";
-    $btnDataCancel = "cancel|{$targetId}|{$chatId}|{$targetMsgId}";
-    
     $keyboard = json_encode(['inline_keyboard' => [
-        [['text' => '🚫 Бан', 'callback_data' => $btnDataBan], ['text' => '🔇 Мут (1ч)', 'callback_data' => $btnDataMute]],
-        [['text' => '⚠️ Варн', 'callback_data' => $btnDataWarn], ['text' => '✅ Оставить', 'callback_data' => $btnDataCancel]]
+        [['text' => '🚫 Бан', 'callback_data' => "ban|$targetId|$chatId|$targetMsgId"], ['text' => '🔇 Мут', 'callback_data' => "mute|$targetId|$chatId|$targetMsgId"]],
+        [['text' => '⚠️ Варн', 'callback_data' => "warn|$targetId|$chatId|$targetMsgId"], ['text' => '✅ Оставить', 'callback_data' => "cancel|$targetId|$chatId|$targetMsgId"]]
     ]]);
 
-    $msgLink = getMessageLink($chatId, $targetMsgId);
-    $header = $isManualReport ? "🚨 <b>ЖАЛОБА (REPORT)</b>" : "🧐 <b>СЕРАЯ ЗОНА ({$aiResult['threat_percent']}%)</b>";
-
-    $aiProviderInfo = $aiResult['used_groq'] ? "\n\n🔄 <i>Проверено резервным ИИ (Groq)</i>" : "";
+    $msgLink = "https://t.me/c/" . str_replace('-100', '', $chatId) . "/$targetMsgId";
+    $header = $isManual ? "🚨 <b>ЖАЛОБА</b>" : "🧐 <b>СЕРАЯ ЗОНА ({$aiRes['threat_percent']}%)</b>";
+    $provider = $aiRes['used_groq'] ? "\n\n🔄 <i>Использован резервный ИИ (Groq)</i>" : "";
 
     $text = "$header\n\n"
-          . "👤 <b>Пользователь:</b> $targetName\n"
-          . "💬 <b>Текст/Медиа:</b> <i>" . htmlspecialchars($targetText) . "</i>\n"
-          . "🔗 <a href='$msgLink'>Перейти к сообщению</a>\n\n"
-          . "🧠 <b>Анализ ИИ:</b>\n"
-          . "Вердикт: <b>{$aiResult['reason']}</b>\n"
-          . "Логика: <i>{$aiResult['ai_logic']}</i>"
-          . $aiProviderInfo;
+          . "👤 <b>От:</b> $targetName\n"
+          . "💬 <b>Текст:</b> <i>" . htmlspecialchars(mb_substr($targetText, 0, 300)) . "</i>\n"
+          . "🔗 <a href='$msgLink'>К сообщению</a>\n\n"
+          . "🧠 <b>Анализ:</b>\n"
+          . "Вердикт: <b>{$aiRes['reason']}</b>\n"
+          . "Логика: <i>{$aiRes['ai_logic']}</i>" . $provider;
 
     tgApi("sendMessage", [
         'chat_id' => !empty($adminGroupId) ? $adminGroupId : $chatId,
@@ -229,144 +209,105 @@ function sendReportToAdmin($chatId, $targetId, $targetMsgId, $targetName, $targe
 }
 
 // ==========================================
-// 🚀 ТОЧКА ВХОДА И ОБРАБОТКА ДАННЫХ
+// 🚀 ТОЧКА ВХОДА
 // ==========================================
 $update = json_decode(file_get_contents("php://input"), true);
 
-// --- 1. КНОПКИ (CALLBACK QUERIES) ---
+// 1. ОБРАБОТКА КНОПОК
 if (isset($update['callback_query'])) {
     $cb = $update['callback_query'];
     $adminUser = $cb['from']['id'];
     $adminName = $cb['from']['username'] ?? $cb['from']['first_name'];
-    $data = explode('|', $cb['data']); 
+    $data = explode('|', $cb['data']);
     
-    $action = $data[0] ?? '';
-    $targetId = $data[1] ?? '';
-    $targetChat = $data[2] ?? '';
-    $msgIdToDelete = $data[3] ?? '';
+    if (count($data) < 4) exit;
+    list($action, $tId, $tChat, $tMsgId) = $data;
 
-    if (!isAdmin($targetChat, $adminUser)) {
-        tgApi("answerCallbackQuery", ['callback_query_id' => $cb['id'], 'text' => "❌ У вас нет прав!", 'show_alert' => true]);
+    if (!isAdmin($tChat, $adminUser)) {
+        tgApi("answerCallbackQuery", ['callback_query_id' => $cb['id'], 'text' => "❌ Нет прав!", 'show_alert' => true]);
         exit;
     }
 
-    $actionText = "";
+    $resText = "";
     if ($action == 'ban') {
-        tgApi("deleteMessage", ['chat_id' => $targetChat, 'message_id' => $msgIdToDelete]);
-        tgApi("banChatMember", ['chat_id' => $targetChat, 'user_id' => $targetId]);
-        $actionText = "🔴 ВЫДАЛ БАН и удалил сообщение";
+        tgApi("deleteMessage", ['chat_id' => $tChat, 'message_id' => $tMsgId]);
+        tgApi("banChatMember", ['chat_id' => $tChat, 'user_id' => $tId]);
+        $resText = "🔴 БАН";
     } elseif ($action == 'mute') {
-        tgApi("deleteMessage", ['chat_id' => $targetChat, 'message_id' => $msgIdToDelete]);
-        tgApi("restrictChatMember", ['chat_id' => $targetChat, 'user_id' => $targetId, 'until_date' => time() + 3600, 'permissions' => json_encode(['can_send_messages' => false])]);
-        $actionText = "🔇 ВЫДАЛ МУТ (1 час) и удалил сообщение";
+        tgApi("deleteMessage", ['chat_id' => $tChat, 'message_id' => $tMsgId]);
+        tgApi("restrictChatMember", ['chat_id' => $tChat, 'user_id' => $tId, 'until_date' => time()+3600, 'permissions' => json_encode(['can_send_messages'=>false])]);
+        $resText = "🔇 МУТ (1ч)";
     } elseif ($action == 'warn') {
-        tgApi("sendMessage", ['chat_id' => $targetChat, 'reply_to_message_id' => $msgIdToDelete, 'text' => "⚠️ <b>Официальное предупреждение от Администратора!</b>\nСоблюдайте правила чата.", 'parse_mode' => 'HTML']);
-        $actionText = "⚠️ ВЫДАЛ ПРЕДУПРЕЖДЕНИЕ";
+        tgApi("sendMessage", ['chat_id' => $tChat, 'reply_to_message_id' => $tMsgId, 'text' => "⚠️ <b>Предупреждение от админа!</b>", 'parse_mode' => 'HTML']);
+        $resText = "⚠️ ВАРН";
     } elseif ($action == 'cancel') {
-        $actionText = "✅ ОСТАВИЛ (Проигнорировал)";
+        $resText = "✅ ОСТАВЛЕНО";
     }
 
-    $originalText = $cb['message']['text'] ?? 'Информация о нарушении.';
-    $newAdminText = "👮‍♂️ <b>Модератор @$adminName принял решение:</b>\n$actionText\n\n〰️〰️〰️\n" . htmlspecialchars($originalText);
-
+    $oldText = $cb['message']['text'];
     tgApi("editMessageText", [
-        'chat_id' => $cb['message']['chat']['id'], 
-        'message_id' => $cb['message']['message_id'], 
-        'text' => $newAdminText,
+        'chat_id' => $cb['message']['chat']['id'],
+        'message_id' => $cb['message']['message_id'],
+        'text' => "👮‍♂️ <b>Админ @$adminName:</b> $resText\n\n$oldText",
         'parse_mode' => 'HTML',
-        'reply_markup' => json_encode(['inline_keyboard' => []]) // Убираем кнопки
+        'reply_markup' => json_encode(['inline_keyboard' => []])
     ]);
-
-    tgApi("answerCallbackQuery", ['callback_query_id' => $cb['id'], 'text' => "Успешно применено!"]);
+    tgApi("answerCallbackQuery", ['callback_query_id' => $cb['id'], 'text' => "Готово"]);
     exit;
 }
 
-// --- 2. ОБРАБОТКА ТЕКСТА И МЕДИА ---
+// 2. ОБРАБОТКА СООБЩЕНИЙ
 $msg = $update['message'] ?? null;
 if (!$msg) exit;
 
 $chatId = $msg['chat']['id'];
 $userId = $msg['from']['id'];
-$msgId  = $msg['message_id'];
-$userName = $msg['from']['username'] ?? $msg['from']['first_name'];
-$targetMsg = $msg['reply_to_message'] ?? null;
-$textRaw = $msg['text'] ?? $msg['caption'] ?? "";
+$userName = $msg['from']['first_name'];
+$text = $msg['text'] ?? $msg['caption'] ?? "";
 
-// Настройки чата и история
-$db = getDb();
-if (!isset($db['chats'][$chatId])) {
-    $db['chats'][$chatId] = ['rules' => ''];
-    saveDb($db);
-}
-if (!empty($textRaw) && strpos($textRaw, '/') !== 0) addHistory($chatId, $userName, $textRaw);
+if (!empty($text) && strpos($text, '/') !== 0) addHistory($chatId, $userName, $text);
 
-if (strpos($textRaw, '/set_rules') === 0 && isAdmin($chatId, $userId)) {
-    $db['chats'][$chatId]['rules'] = trim(str_replace('/set_rules', '', $textRaw));
-    saveDb($db);
-    tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "✅ Кодекс чата обновлен!"]);
+// Ручной репорт
+if (trim($text) == '/report' && isset($msg['reply_to_message'])) {
+    tgApi("deleteMessage", ['chat_id' => $chatId, 'message_id' => $msg['message_id']]);
+    $tMsg = $msg['reply_to_message'];
+    $res = aiCheckMessage($chatId, "[REPORT]: " . ($tMsg['text'] ?? "Медиа"), null, "Жалоба пользователя.");
+    sendReportToAdmin($chatId, $tMsg['from']['id'], $tMsg['message_id'], $tMsg['from']['first_name'], ($tMsg['text'] ?? "Медиа"), $res, true);
     exit;
 }
 
-if (trim($textRaw) == '/report' && $targetMsg) {
-    tgApi("deleteMessage", ['chat_id' => $chatId, 'message_id' => $msgId]); 
-    $targetId = $targetMsg['from']['id'];
-    $targetName = $targetMsg['from']['first_name'];
-    $targetText = $targetMsg['text'] ?? $targetMsg['caption'] ?? "[Медиа/Стикер]";
-    
-    $history = implode("\n", $db['chats'][$chatId]['history'] ?? []);
-    $res = aiCheckMessage($chatId, "[ЖАЛОБА]: " . $targetText, null, $history);
-    
-    sendReportToAdmin($chatId, $targetId, $targetMsg['message_id'], $targetName, $targetText, $res, true);
-    exit;
-}
-
-// Защита от проверок самих админов
+// Авто-модерация (кроме админов)
 if (isAdmin($chatId, $userId)) exit;
 
-$contentToAnalyze = '';
-$imgData = null;
-
-if (isset($msg['text'])) {
-    $contentToAnalyze = "[Текст]: " . $msg['text'];
-} elseif (isset($msg['photo'])) {
-    $fileId = end($msg['photo'])['file_id'];
-    $imgData = getFileBase64($fileId, $token);
-    $contentToAnalyze = "[Фото]: " . ($msg['caption'] ?? 'Опиши это фото и проверь на нарушения.');
+$img = null;
+$type = "[Текст]";
+if (isset($msg['photo'])) {
+    $img = getFileBase64(end($msg['photo'])['file_id'], $token);
+    $type = "[Фото]";
 } elseif (isset($msg['sticker'])) {
-    $fileId = $msg['sticker']['file_id'];
-    $emoji = $msg['sticker']['emoji'] ?? '';
     if (!$msg['sticker']['is_animated'] && !$msg['sticker']['is_video']) {
-        $imgData = getFileBase64($fileId, $token);
+        $img = getFileBase64($msg['sticker']['file_id'], $token);
     }
-    $contentToAnalyze = "[Стикер]: Эмодзи $emoji. " . ($imgData ? "Прочитай текст и опиши." : "(Анимация. Суди по эмодзи и контексту)");
+    $type = "[Стикер " . ($msg['sticker']['emoji'] ?? "") . "]";
 }
 
-if (empty($contentToAnalyze)) exit;
+if (empty($text) && !$img) exit;
 
-$historyContext = implode("\n", $db['chats'][$chatId]['history'] ?? []);
-$res = aiCheckMessage($chatId, $contentToAnalyze, $imgData, $historyContext);
-$threat = $res['threat_percent'] ?? 0;
+$db = getDb();
+$hist = implode("\n", $db['chats'][$chatId]['history'] ?? []);
+$ai = aiCheckMessage($chatId, "$type: $text", $img, $hist);
 
+$threat = $ai['threat_percent'] ?? 0;
 if ($threat >= 50) {
-    tgApi("deleteMessage", ['chat_id' => $chatId, 'message_id' => $msgId]);
-    $action = $res['suggested_action'] ?? 'warn';
-    $info = "сообщение удалено";
-    if ($action == 'mute') {
-        tgApi("restrictChatMember", ['chat_id' => $chatId, 'user_id' => $userId, 'until_date' => time() + 3600, 'permissions' => json_encode(['can_send_messages' => false])]);
-        $info = "выдан МУТ (1 час)";
-    } elseif ($action == 'ban') {
-        tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $userId]);
-        $info = "выдан БАН";
-    }
+    tgApi("deleteMessage", ['chat_id' => $chatId, 'message_id' => $msg['message_id']]);
+    $act = $ai['suggested_action'] ?? 'del';
+    $status = "удалено";
+    if ($act == 'ban') { tgApi("banChatMember", ['chat_id' => $chatId, 'user_id' => $userId]); $status = "забанен"; }
+    if ($act == 'mute') { tgApi("restrictChatMember", ['chat_id' => $chatId, 'user_id' => $userId, 'until_date' => time()+3600, 'permissions' => json_encode(['can_send_messages'=>false])]); $status = "в муте (1ч)"; }
     
-    $groqNotice = $res['used_groq'] ? "\n<i>(Сработал резервный ИИ Groq)</i>" : "";
-    tgApi("sendMessage", [
-        'chat_id' => $chatId, 
-        'text' => "🛡 <b>ИИ Судья:</b> Пользователь @$userName нарушил правила — <b>$info</b>.\n\n🧠 Причина: <i>{$res['reason']}</i>$groqNotice", 
-        'parse_mode' => 'HTML'
-    ]);
-} elseif ($threat > 0 && $threat < 50) {
-    $targetText = $msg['text'] ?? $msg['caption'] ?? "[Медиа/Стикер]";
-    sendReportToAdmin($chatId, $userId, $msgId, $userName, $targetText, $res);
+    $provider = $ai['used_groq'] ? "\n<i>(Backup AI)</i>" : "";
+    tgApi("sendMessage", ['chat_id' => $chatId, 'text' => "🛡 <b>ИИ:</b> @$userName $status.\nПричина: {$ai['reason']}$provider", 'parse_mode' => 'HTML']);
+} elseif ($threat > 0) {
+    sendReportToAdmin($chatId, $userId, $msg['message_id'], $userName, $text, $ai);
 }
 ?>
