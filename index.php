@@ -5,7 +5,7 @@
 ini_set('display_errors', 0); 
 
 $token        = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0"; 
-$adminId      = 123456789; // ТВОЙ ЛИЧНЫЙ ID (для полных логов)
+$adminId      =  7640692963; // ТВОЙ ЛИЧНЫЙ ID (для полных логов)
 $adminGroupId = "-1003812180726"; // ID ГРУППЫ АДМИНОВ (для репортов)
 
 $geminiKey    = "AIzaSyANstszxxWi1AYgZvAPpQc_gQsjuPjRbBc"; 
