@@ -3,7 +3,7 @@
 ini_set('display_errors', 0);
 $token   = "8424479487:AAGxVxfmzN4E9sgeSYVlz4JOQUDyZ23E3s0"; 
 $adminId = 123456789; // ТВОЙ_ЛИЧНЫЙ_ID
-$adminGroupId = "-1001234567890"; // ID ГРУППЫ АДМИНОВ (или оставь пустым "", тогда бот будет кидать кнопки прямо в текущий чат)
+$adminGroupId = "-1003812180726"; // ID ГРУППЫ АДМИНОВ (или оставь пустым "", тогда бот будет кидать кнопки прямо в текущий чат)
 $api     = "https://api.telegram.org/bot" . $token;
 
 $geminiKey = "AIzaSyANstszxxWi1AYgZvAPpQc_gQsjuPjRbBc"; 
